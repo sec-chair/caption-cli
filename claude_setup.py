@@ -213,9 +213,6 @@ def fetch_setup_payload(auth_token: str) -> Mapping[str, object]:
     with httpx.Client(timeout=15.0) as client:
         response = client.get(SETUP_API_URL, headers=headers)
 
-    print(f"HTTP {response.status_code}")
-    print(response.text)
-
     if response.status_code >= 400:
         detail = response.text.strip() or response.reason_phrase
         raise SetupError(f"Setup request failed ({response.status_code}): {detail}")
