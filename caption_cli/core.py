@@ -263,7 +263,7 @@ def _is_meili_auth_error(err: Exception) -> bool:
 def _require_api_token(config: RuntimeConfig) -> str:
     if config.api_token and config.api_token.strip():
         return config.api_token.strip()
-    raise CliError("Missing API bearer token. Set CAPTION_TOKEN")
+    raise CliError("Missing API bearer token. Set CLERK_API_KEY")
 
 
 def _require_cached_or_fresh_token(config: RuntimeConfig) -> SearchToken:

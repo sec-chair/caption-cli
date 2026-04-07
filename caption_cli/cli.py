@@ -37,7 +37,7 @@ def _top_level_help_epilog(specs: Sequence[CommandSpec]) -> str:
     lines = [
         "Environment",
         "  CAPTION_API_URL   required for all commands",
-        "  CAPTION_TOKEN     required for authenticated API calls",
+        "  CLERK_API_KEY     required for authenticated API calls",
         "  CAPTION_MEILI_URL required for token and search",
         "",
         "Global options",
@@ -385,7 +385,7 @@ def run(argv: Sequence[str] | None = None) -> int:
 
     config = RuntimeConfig(
         api_url=os.getenv("CAPTION_API_URL"),
-        api_token=os.getenv("CAPTION_TOKEN"),
+        api_token=os.getenv("CLERK_API_KEY"),
         meili_url=os.getenv("CAPTION_MEILI_URL"),
         cache_path=Path(args.cache_path),
         output=args.output,

@@ -35,7 +35,7 @@ def write_cache(path: Path, token: str = "cached-token", url: str = "https://cac
 
 def set_runtime_env(monkeypatch: pytest.MonkeyPatch, *, meili_url: str | None = "https://configured.meili") -> None:
     monkeypatch.setenv("CAPTION_API_URL", "http://localhost:8000")
-    monkeypatch.setenv("CAPTION_TOKEN", "api-token")
+    monkeypatch.setenv("CLERK_API_KEY", "api-token")
     if meili_url is None:
         monkeypatch.delenv("CAPTION_MEILI_URL", raising=False)
     else:
@@ -244,7 +244,7 @@ def test_top_level_help_contains_single_page_cheat_sheet(capsys: pytest.CaptureF
     output = capsys.readouterr().out
     assert "Command Cheat Sheet" in output
     assert "CAPTION_API_URL" in output
-    assert "CAPTION_TOKEN" in output
+    assert "CLERK_API_KEY" in output
     assert "CAPTION_MEILI_URL" in output
     assert "--api-url" not in output
     assert "--api-token" not in output
@@ -1284,7 +1284,7 @@ def test_run_create_folder_does_not_require_meili_url(monkeypatch: pytest.Monkey
 
 def test_run_fails_when_api_url_is_missing(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("CAPTION_API_URL", raising=False)
-    monkeypatch.setenv("CAPTION_TOKEN", "api-token")
+    monkeypatch.setenv("CLERK_API_KEY", "api-token")
     monkeypatch.setenv("CAPTION_MEILI_URL", "https://configured.meili")
 
     with pytest.raises(core.CliError, match="Missing Caption API URL"):
@@ -1294,7 +1294,7 @@ def test_run_fails_when_api_url_is_missing(monkeypatch: pytest.MonkeyPatch) -> N
 def test_run_fails_when_meili_url_is_missing(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("CAPTION_MEILI_URL", raising=False)
     monkeypatch.setenv("CAPTION_API_URL", "http://localhost:8000")
-    monkeypatch.setenv("CAPTION_TOKEN", "api-token")
+    monkeypatch.setenv("CLERK_API_KEY", "api-token")
 
     with pytest.raises(core.CliError, match="Missing Meilisearch URL"):
         cli.run(["--env-file", "", "token"])
