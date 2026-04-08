@@ -172,7 +172,7 @@ def collect_organization_credentials(
 
 
 def build_env_values(payload: Mapping[str, object], auth_token: str) -> BuildResult:
-    env_values: dict[str, str] = {"CAPTION_TOKEN": auth_token}
+    env_values: dict[str, str] = {"CLERK_API_KEY": auth_token}
     skipped_null_keys: set[str] = set()
 
     organizations = payload.get("organizations", [])

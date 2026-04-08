@@ -30,7 +30,7 @@ def test_build_env_values_collects_root_keys_and_org_credentials() -> None:
     result = claude_setup.build_env_values(payload, "setup-token")
 
     assert result.env_values == {
-        "CAPTION_TOKEN": "setup-token",
+        "CLERK_API_KEY": "setup-token",
         "CAPTION_API_URL": "https://dev-api.caption.fyi",
         "CAPTION_MEILI_URL": "https://meili.example.com",
         "ARTIFACT_API_TOKEN": "artifact-token",
@@ -52,7 +52,7 @@ def test_build_env_values_does_not_fill_null_root_key_with_auth_token() -> None:
     result = claude_setup.build_env_values(payload, "setup-token")
 
     assert result.env_values == {
-        "CAPTION_TOKEN": "setup-token",
+        "CLERK_API_KEY": "setup-token",
         "CAPTION_API_URL": "https://dev-api.caption.fyi",
         "CAPTION_MEILI_URL": "https://meili.example.com",
     }
