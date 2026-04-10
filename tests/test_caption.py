@@ -213,6 +213,7 @@ def test_dl_transcript_command_is_available() -> None:
     args = cli.parse_args(["dl_transcript", "transcript-1"])
     assert args.command == "dl_transcript"
     assert args.transcript_id == "transcript-1"
+    assert args.timestamp is False
     assert args.output == "md"
 
 
@@ -226,6 +227,11 @@ def test_command_default_outputs_are_applied() -> None:
 def test_explicit_output_overrides_dl_transcript_default() -> None:
     args = cli.parse_args(["--output", "json", "dl_transcript", "transcript-1"])
     assert args.output == "json"
+
+
+def test_dl_transcript_accepts_timestamp_flag() -> None:
+    args = cli.parse_args(["dl_transcript", "transcript-1", "--timestamp"])
+    assert args.timestamp is True
 
 
 def test_removed_global_flags_are_rejected() -> None:
@@ -817,67 +823,70 @@ def test_dl_transcript_fetches_captions_for_transcript(
     monkeypatch: pytest.MonkeyPatch,
     config: core.RuntimeConfig,
 ) -> None:
-    calls: list[tuple[str, str, str]] = []
+    calls: list[tuple[str, str, str, dict[str, object] | None]] = []
 
-    def fake_authorized_get_list_of_objects(
+    def fake_authorized_get_text(
         api_url: str,
         api_token: str,
         path: str,
-    ) -> list[dict[str, object]]:
-        calls.append((api_url, api_token, path))
-        return [
-            {
-                "id": "c1",
-                "createdAt": "2024-01-01T00:00:00Z",
-                "updatedAt": "2024-01-01T00:00:01Z",
-                "session": "s1",
-                "speaker": None,
-                "channel": 0,
-                "index": 0,
-                "content": "First line",
-            },
-            {
-                "id": "c2",
-                "createdAt": "2024-01-01T00:00:02Z",
-                "updatedAt": "2024-01-01T00:00:03Z",
-                "session": "s1",
-                "speaker": "speaker-1",
-                "channel": 1,
-                "index": 1,
-                "content": "Second line",
-            },
-        ]
+        params: dict[str, object] | None = None,
+    ) -> str:
+        calls.append((api_url, api_token, path, params))
+        return "[15:01.23] me: First line"
 
-    monkeypatch.setattr(commands, "_authorized_get_list_of_objects", fake_authorized_get_list_of_objects)
+    monkeypatch.setattr(commands, "_authorized_get_text", fake_authorized_get_text)
 
     result = commands.dl_transcript(config, transcript_id="transcript-uuid")
 
     assert calls == [
-        ("http://localhost:8000", "api-token", "/transcripts/transcript-uuid/captions"),
+        (
+            "http://localhost:8000",
+            "api-token",
+            "/transcripts/transcript-uuid/export/text",
+            {"includeHeader": "false"},
+        ),
     ]
-    assert result["transcriptId"] == "transcript-uuid"
-    assert result["count"] == 2
-    assert [item["id"] for item in result["items"]] == ["c1", "c2"]
+    assert result == "me: First line"
 
 
-def test_transcript_items_to_md_merges_consecutive_speaker_lines() -> None:
-    transcript_items = [
-        {"createdAt": "2025-12-18T15:01:23Z", "channel": 0, "index": 0, "content": "think bryce"},
-        {"createdAt": "2025-12-18T15:01:23.400Z", "channel": 1, "index": 0, "content": "hear me"},
-        {"createdAt": "2025-12-18T15:01:25Z", "channel": 0, "index": 0, "content": "is gonna"},
-        {"createdAt": "2025-12-18T15:01:25.200Z", "channel": 0, "index": 0, "content": "blank room now"},
-        {"createdAt": "2025-12-18T15:01:30Z", "channel": 1, "index": 0, "content": "oh for the yeah"},
-    ]
+def test_dl_transcript_preserves_timestamps_when_requested(
+    monkeypatch: pytest.MonkeyPatch,
+    config: core.RuntimeConfig,
+) -> None:
+    def fake_authorized_get_text(
+        api_url: str,
+        api_token: str,
+        path: str,
+        params: dict[str, object] | None = None,
+    ) -> str:
+        assert api_url == "http://localhost:8000"
+        assert api_token == "api-token"
+        assert path == "/transcripts/transcript-uuid/export/text"
+        assert params == {"includeHeader": "false"}
+        return "[15:01.23] me: First line"
 
-    output = core._transcript_items_to_md(transcript_items)
+    monkeypatch.setattr(commands, "_authorized_get_text", fake_authorized_get_text)
 
-    assert output == "\n".join(
-        [
-            "[15:01.23] me: think bryce",
-            "[15:01.23] meeting-0: hear me",
-            "[15:01.25] me: is gonna blank room now",
-            "[15:01.30] meeting-0: oh for the yeah",
-        ]
+    result = commands.dl_transcript(config, transcript_id="transcript-uuid", timestamp=True)
+
+    assert result == "[15:01.23] me: First line"
+
+
+def test_strip_transcript_timestamps_handles_iso_export_lines() -> None:
+    transcript_text = (
+        "# From Friday, April 10, 2026 at 9:21 AM\n\n"
+        "[2026-04-10T14:23:23.875Z] Microphone:0\n"
+        "  so when i start talking\n"
+        "[2026-04-10T14:23:36.524Z] Microphone:1\n"
+        "  because of the fact\n"
+    )
+
+    assert commands._strip_transcript_timestamps(transcript_text) == (
+        "# From Friday, April 10, 2026 at 9:21 AM\n\n"
+        "Microphone:0\n"
+        "  so when i start talking\n"
+        "Microphone:1\n"
+        "  because of the fact\n"
     )
 
 
@@ -938,13 +947,6 @@ def test_emit_output_search_table_for_projects_uses_condensed_columns(
     assert "20260209" in out
     assert "scope" not in out
     assert "format" not in out
-
-
-def test_transcript_items_to_md_rejects_missing_channel() -> None:
-    with pytest.raises(core.CliError, match="Transcript item 0 missing integer 'channel'"):
-        core._transcript_items_to_md(
-            [{"createdAt": "2025-12-18T15:01:23Z", "index": 0, "content": "hello"}]
-        )
 
 
 def test_command_edit_project_requires_update_fields(config: core.RuntimeConfig) -> None:
@@ -1085,35 +1087,10 @@ def test_run_dl_transcript_does_not_require_meili_url(
 ) -> None:
     set_runtime_env(monkeypatch, meili_url=None)
 
-    def fake_dl_transcript(config: core.RuntimeConfig, *, transcript_id: str) -> dict[str, object]:
+    def fake_dl_transcript(config: core.RuntimeConfig, *, transcript_id: str, timestamp: bool = False) -> str:
         assert transcript_id == "transcript-uuid"
-        return {
-            "transcriptId": transcript_id,
-            "items": [
-                {
-                    "id": "c1",
-                    "createdAt": "2025-12-18T15:01:23Z",
-                    "channel": 0,
-                    "index": 0,
-                    "content": "hello",
-                },
-                {
-                    "id": "c2",
-                    "createdAt": "2025-12-18T15:01:23.400Z",
-                    "channel": 0,
-                    "index": 0,
-                    "content": "there",
-                },
-                {
-                    "id": "c3",
-                    "createdAt": "2025-12-18T15:01:24Z",
-                    "channel": 1,
-                    "index": 0,
-                    "content": "hi",
-                },
-            ],
-            "count": 3,
-        }
+        assert timestamp is False
+        return "me: hello there\nmeeting-0: hi"
 
     monkeypatch.setattr(cli, "dl_transcript", fake_dl_transcript)
 
@@ -1130,6 +1107,35 @@ def test_run_dl_transcript_does_not_require_meili_url(
 
     assert exit_code == 0
     captured = capsys.readouterr()
+    assert captured.out == "me: hello there\nmeeting-0: hi\n"
+
+
+def test_run_dl_transcript_with_timestamp_flag_preserves_timestamps(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    set_runtime_env(monkeypatch, meili_url=None)
+
+    def fake_dl_transcript(config: core.RuntimeConfig, *, transcript_id: str, timestamp: bool = False) -> str:
+        assert transcript_id == "transcript-uuid"
+        assert timestamp is True
+        return "[15:01.23] me: hello there\n[15:01.24] meeting-0: hi"
+
+    monkeypatch.setattr(cli, "dl_transcript", fake_dl_transcript)
+
+    exit_code = cli.run(
+        [
+            "--env-file",
+            "",
+            "--cache-path",
+            str(tmp_path / "search-token.json"),
+            "dl_transcript",
+            "transcript-uuid",
+            "--timestamp",
+        ]
+    )
+
+    assert exit_code == 0
+    captured = capsys.readouterr()
     assert captured.out == "[15:01.23] me: hello there\n[15:01.24] meeting-0: hi\n"
 
 
@@ -1138,22 +1144,11 @@ def test_run_dl_transcript_with_json_output_emits_raw_payload(
 ) -> None:
     set_runtime_env(monkeypatch, meili_url=None)
 
-    payload = {
-        "transcriptId": "transcript-uuid",
-        "items": [
-            {
-                "id": "c1",
-                "createdAt": "2025-12-18T15:01:23Z",
-                "channel": 0,
-                "index": 0,
-                "content": "hello",
-            }
-        ],
-        "count": 1,
-    }
+    payload = "me: hello"
 
-    def fake_dl_transcript(config: core.RuntimeConfig, *, transcript_id: str) -> dict[str, object]:
+    def fake_dl_transcript(config: core.RuntimeConfig, *, transcript_id: str, timestamp: bool = False) -> str:
         assert transcript_id == "transcript-uuid"
+        assert timestamp is False
         return payload
 
     monkeypatch.setattr(cli, "dl_transcript", fake_dl_transcript)
@@ -1173,7 +1168,7 @@ def test_run_dl_transcript_with_json_output_emits_raw_payload(
 
     assert exit_code == 0
     captured = capsys.readouterr()
-    assert json.loads(captured.out) == payload
+    assert json.loads(captured.out) == "me: hello"
 
 
 def test_run_create_project_does_not_require_meili_url(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

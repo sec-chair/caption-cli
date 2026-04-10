@@ -30,7 +30,7 @@ from caption_cli.core import (
     emit_output,
 )
 
-DEFAULT_ENV_FILE = Path(__file__).resolve().parents[2] / ".env"
+DEFAULT_ENV_FILE = Path(__file__).resolve().parents[1] / ".env"
 
 
 def _top_level_help_epilog(specs: Sequence[CommandSpec]) -> str:
@@ -197,6 +197,11 @@ def _add_edit_folder_arguments(parser: argparse.ArgumentParser) -> None:
 
 def _add_dl_transcript_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("transcript_id", help="Transcript UUID")
+    parser.add_argument(
+        "--timestamp",
+        action="store_true",
+        help="Keep timestamps in transcript output",
+    )
 
 
 def _handle_token(config: RuntimeConfig, args: argparse.Namespace) -> dict[str, Any]:
@@ -258,8 +263,8 @@ def _handle_edit_folder(config: RuntimeConfig, args: argparse.Namespace) -> dict
     )
 
 
-def _handle_dl_transcript(config: RuntimeConfig, args: argparse.Namespace) -> dict[str, Any]:
-    return dl_transcript(config, transcript_id=args.transcript_id)
+def _handle_dl_transcript(config: RuntimeConfig, args: argparse.Namespace) -> Any:
+    return dl_transcript(config, transcript_id=args.transcript_id, timestamp=args.timestamp)
 
 
 def _command_specs() -> Sequence[CommandSpec]:
@@ -366,10 +371,10 @@ def _command_specs() -> Sequence[CommandSpec]:
             add_arguments=_add_dl_transcript_arguments,
             handler=_handle_dl_transcript,
             default_output="md",
-            usage="caption dl_transcript <transcript_id>",
+            usage="caption dl_transcript <transcript_id> [--timestamp]",
             notes=(
-                "Default output is markdown: [HH:MM.SS] speaker: content.",
-                "Use --output json for raw payload.",
+                "Default output strips leading timestamps from each transcript line.",
+                "Pass --timestamp to preserve them in output.",
             ),
             example="caption --output json dl_transcript <transcript-uuid>",
         ),

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from typing import Any, Callable, Mapping
 
 import meilisearch
@@ -8,6 +9,7 @@ from caption_cli.core import (
     CliError,
     RuntimeConfig,
     WORKSPACE_LIST_PAGE_SIZE,
+    _authorized_get_text,
     _authorized_get_list_of_objects,
     _authorized_request,
     _folder_view,
@@ -107,6 +109,14 @@ def _clean_required_id(identifier: str, label: str) -> str:
     if not cleaned_identifier:
         raise CliError(f"{label} cannot be empty")
     return cleaned_identifier
+
+
+def _strip_transcript_timestamps(transcript_text: str) -> str:
+    return re.sub(
+        r"(?m)^\[(?:\d{2}:\d{2}\.\d{2}(?:\.\d+)?|\d{4}-\d{2}-\d{2}T[^\]]+)\]\s*",
+        "",
+        transcript_text,
+    )
 
 
 def _build_create_body(
@@ -302,17 +312,16 @@ def command_edit_folder(
     return _folder_view(payload)
 
 
-def dl_transcript(config: RuntimeConfig, *, transcript_id: str) -> dict[str, Any]:
+def dl_transcript(config: RuntimeConfig, *, transcript_id: str, timestamp: bool = False) -> str:
     api_url = _require_api_url(config)
     api_token = _require_api_token(config)
     cleaned_transcript_id = _clean_required_id(transcript_id, "transcript_id")
-    captions = _authorized_get_list_of_objects(
+    transcript_text = _authorized_get_text(
         api_url,
         api_token,
-        f"/transcripts/{cleaned_transcript_id}/captions",
+        f"/transcripts/{cleaned_transcript_id}/export/text",
+        params={"includeHeader": "false"},
     )
-    return {
-        "transcriptId": cleaned_transcript_id,
-        "items": captions,
-        "count": len(captions),
-    }
+    if timestamp:
+        return transcript_text
+    return _strip_transcript_timestamps(transcript_text)

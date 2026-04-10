@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import json
 from dataclasses import dataclass
-from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
@@ -140,6 +139,24 @@ def _authorized_get(
     params: Mapping[str, int] | None = None,
 ) -> Mapping[str, Any]:
     return _authorized_request(api_url, api_token, "GET", path, params=params)
+
+
+def _authorized_get_text(
+    api_url: str,
+    api_token: str,
+    path: str,
+    params: Mapping[str, Any] | None = None,
+) -> str:
+    url = f"{api_url.rstrip('/')}/{path.lstrip('/')}"
+    headers = {"Authorization": f"Bearer {api_token}"}
+    with httpx.Client(timeout=15.0) as client:
+        response = client.get(url, headers=headers, params=params)
+
+    if response.status_code != 200:
+        detail = response.text.strip() or response.reason_phrase
+        raise CliError(f"Failed GET {path} ({response.status_code}): {detail}")
+
+    return response.text
 
 
 def _authorized_get_list_of_objects(
@@ -428,81 +445,6 @@ def _render_search_summary_table(value: Any, index_uid: str | None) -> str:
     return _render_table(value)
 
 
-def _parse_iso_datetime(raw_value: str, *, label: str) -> datetime:
-    normalized = raw_value
-    if raw_value.endswith("Z"):
-        normalized = f"{raw_value[:-1]}+00:00"
-    try:
-        return datetime.fromisoformat(normalized)
-    except ValueError as exc:
-        raise CliError(f"{label} must be an ISO datetime string, got: {raw_value}") from exc
-
-
-def _speaker_label_for_transcript_item(item: Mapping[str, Any], *, item_index: int) -> str:
-    channel = item.get("channel")
-    if not isinstance(channel, int):
-        raise CliError(f"Transcript item {item_index} missing integer 'channel'")
-
-    diarization_index = item.get("index")
-    if not isinstance(diarization_index, int):
-        raise CliError(f"Transcript item {item_index} missing integer 'index'")
-
-    if channel == 0:
-        return "me"
-    if channel == 1:
-        return f"meeting-{diarization_index}"
-
-    raise CliError(f"Transcript item {item_index} has unsupported channel: {channel}")
-
-
-def _transcript_items_to_md(items: Sequence[Mapping[str, Any]]) -> str:
-    grouped_entries: list[dict[str, Any]] = []
-    paragraph: dict[str, Any] | None = None
-
-    for item_index, item in enumerate(items):
-        created_at = item.get("createdAt")
-        if not isinstance(created_at, str):
-            raise CliError(f"Transcript item {item_index} missing string 'createdAt'")
-        created_at_dt = _parse_iso_datetime(created_at, label=f"Transcript item {item_index} field 'createdAt'")
-
-        content = item.get("content")
-        if not isinstance(content, str):
-            raise CliError(f"Transcript item {item_index} missing string 'content'")
-
-        speaker = _speaker_label_for_transcript_item(item, item_index=item_index)
-        if paragraph is None or paragraph["speaker"] != speaker:
-            if paragraph is not None:
-                grouped_entries.append(paragraph)
-            paragraph = {
-                "speaker": speaker,
-                "earliest_timestamp": created_at_dt,
-                "content_parts": [content],
-            }
-            continue
-
-        paragraph["content_parts"].append(content)
-        if created_at_dt < paragraph["earliest_timestamp"]:
-            paragraph["earliest_timestamp"] = created_at_dt
-
-    if paragraph is not None:
-        grouped_entries.append(paragraph)
-
-    markdown_lines: list[str] = []
-    for entry in grouped_entries:
-        formatted_time = entry["earliest_timestamp"].strftime("%H:%M.%S")
-        merged_content = " ".join(entry["content_parts"])
-        markdown_lines.append(f"[{formatted_time}] {entry['speaker']}: {merged_content}")
-    return "\n".join(markdown_lines)
-
-
-def _is_transcript_payload(value: Any) -> bool:
-    if not isinstance(value, dict):
-        return False
-    transcript_id = value.get("transcriptId")
-    items = value.get("items")
-    return isinstance(transcript_id, str) and isinstance(items, list)
-
-
 def emit_output(
     value: Any,
     output_format: str,
@@ -513,11 +455,8 @@ def emit_output(
     if output_format == "json":
         print(json.dumps(value, indent=2))
         return
-    if output_format == "md" and _is_transcript_payload(value):
-        items = value["items"]
-        if not all(isinstance(item, dict) for item in items):
-            raise CliError("dl_transcript payload field 'items' must be an array of objects")
-        print(_transcript_items_to_md(items))
+    if output_format == "md" and isinstance(value, str):
+        print(value)
         return
     if output_format == "table" and command_name == "search":
         print(_render_search_summary_table(value, search_index))
