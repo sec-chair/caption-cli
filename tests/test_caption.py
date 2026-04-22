@@ -842,7 +842,7 @@ def test_dl_transcript_fetches_captions_for_transcript(
         (
             "http://localhost:8000",
             "api-token",
-            "/transcripts/transcript-uuid/export/text",
+            "/transcripts/transcript-uuid/export/txt",
             {"includeHeader": "false"},
         ),
     ]
@@ -861,7 +861,7 @@ def test_dl_transcript_preserves_timestamps_when_requested(
     ) -> str:
         assert api_url == "http://localhost:8000"
         assert api_token == "api-token"
-        assert path == "/transcripts/transcript-uuid/export/text"
+        assert path == "/transcripts/transcript-uuid/export/txt"
         assert params == {"includeHeader": "false"}
         return "[15:01.23] me: First line"
 

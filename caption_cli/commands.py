@@ -320,7 +320,7 @@ def dl_transcript(config: RuntimeConfig, *, transcript_id: str, timestamp: bool 
     transcript_text = _authorized_get_text(
         api_url,
         api_token,
-        f"/transcripts/{cleaned_transcript_id}/export/text",
+        f"/transcripts/{cleaned_transcript_id}/export/txt",
         params={"includeHeader": "false"},
     )
     if timestamp:
