@@ -120,36 +120,19 @@ def _placeholders(values: Iterable[object]) -> str:
 def select_sessions(
     conn: sqlite3.Connection,
     *,
-    session_ids: list[str],
-    project: str | None,
-    agent: str | None,
-    started_after: str | None,
-    started_before: str | None,
-    limit: int | None,
+    session_id_query: str,
 ) -> list[sqlite3.Row]:
     params: list[Any] = []
     query = SESSION_SQL
 
-    if session_ids:
-        query += f" AND id IN ({_placeholders(session_ids)})"
-        params.extend(session_ids)
-    if project is not None:
-        query += " AND project = ?"
-        params.append(project)
-    if agent is not None:
-        query += " AND agent = ?"
-        params.append(agent)
-    if started_after is not None:
-        query += " AND started_at > ?"
-        params.append(started_after)
-    if started_before is not None:
-        query += " AND started_at < ?"
-        params.append(started_before)
-
+    cleaned_session_id_query = _require_value(
+        _clean_optional(session_id_query, "--session-id"),
+        "--session-id",
+    )
+    if cleaned_session_id_query != "*":
+        query += " AND id LIKE ? ESCAPE '\\' COLLATE NOCASE"
+        params.append(f"%{_escape_like(cleaned_session_id_query)}%")
     query += " ORDER BY started_at DESC, id"
-    if limit is not None:
-        query += " LIMIT ?"
-        params.append(limit)
 
     try:
         return list(conn.execute(query, params).fetchall())
@@ -332,49 +315,17 @@ def build_payload_for_session(
 def build_payloads(
     db_path: Path,
     *,
-    session_ids: list[str],
-    project: str | None,
-    agent: str | None,
-    started_after: str | None,
-    started_before: str | None,
-    limit: int | None,
+    session_id_query: str,
 ) -> list[dict[str, object]]:
     conn = snapshot_db(db_path)
     try:
         session_rows = select_sessions(
             conn,
-            session_ids=session_ids,
-            project=project,
-            agent=agent,
-            started_after=started_after,
-            started_before=started_before,
-            limit=limit,
+            session_id_query=session_id_query,
         )
         return [build_payload_for_session(conn, session_row) for session_row in session_rows]
     finally:
         conn.close()
-
-
-def write_payloads(payloads: list[dict[str, object]], out_dir: Path) -> list[Path]:
-    resolved_out_dir = out_dir.expanduser()
-    try:
-        resolved_out_dir.mkdir(parents=True, exist_ok=True)
-    except OSError as exc:
-        raise CliError(f"Failed creating output directory {resolved_out_dir}: {exc}") from exc
-
-    written_paths: list[Path] = []
-    for payload in payloads:
-        share_id = payload["share_id"]
-        if not isinstance(share_id, str) or not share_id:
-            raise CliError("Payload missing share_id")
-        path = resolved_out_dir / f"{share_id}.json"
-        try:
-            path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
-        except OSError as exc:
-            raise CliError(f"Failed writing payload file {path}: {exc}") from exc
-        written_paths.append(path)
-    return written_paths
-
 
 def send_payload(
     base_url: str,
@@ -440,50 +391,22 @@ def send_payloads(
     }
 
 
-def _clean_session_ids(values: list[str] | None) -> list[str]:
-    if not values:
-        return []
-    out: list[str] = []
-    for value in values:
-        cleaned = _clean_optional(value, "--session-id")
-        if cleaned is None:
-            continue
-        out.append(cleaned)
-    return out
-
-
-def _clean_optional_arg(value: str | None, label: str) -> str | None:
-    return _clean_optional(value, label)
+def _escape_like(value: str) -> str:
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
 def _build_payloads_from_args(args: argparse.Namespace) -> list[dict[str, object]]:
-    payloads = build_payloads(
+    return build_payloads(
         Path(args.db_path).expanduser(),
-        session_ids=_clean_session_ids(args.session_id),
-        project=_clean_optional_arg(args.project, "--project"),
-        agent=_clean_optional_arg(args.agent, "--agent"),
-        started_after=_clean_optional_arg(args.started_after, "--started-after"),
-        started_before=_clean_optional_arg(args.started_before, "--started-before"),
-        limit=args.limit,
+        session_id_query=args.session_id,
     )
-    return payloads
 
 
-def command_agentsview_build(_: Any, args: argparse.Namespace) -> object:
+def command_sync(_: Any, args: argparse.Namespace) -> object:
     payloads = _build_payloads_from_args(args)
-    if args.out_dir is None:
+    if args.test:
         return payloads
 
-    written_paths = write_payloads(payloads, Path(args.out_dir))
-    return {
-        "count": len(payloads),
-        "share_ids": [payload["share_id"] for payload in payloads],
-        "files": [str(path) for path in written_paths],
-    }
-
-
-def command_agentsview_send(_: Any, args: argparse.Namespace) -> dict[str, object]:
-    payloads = _build_payloads_from_args(args)
     clerk_api_key = _require_value(
         _clean_optional(args.clerk_api_key, "--clerk-api-key") or os.getenv("CLERK_API_KEY"),
         "Clerk API key (--clerk-api-key or CLERK_API_KEY)",

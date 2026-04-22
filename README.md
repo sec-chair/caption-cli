@@ -3,7 +3,7 @@
 This repo has one CLI entrypoint and one agentsview support module. Treating them as separate tools matters:
 
 - [`caption.py`](/Users/alin/code/caption/caption-cli/caption.py) is the executable entrypoint.
-- [`caption_cli/agentsview.py`](/Users/alin/code/caption/caption-cli/caption_cli/agentsview.py) is not a standalone script. It powers the `agentsview_build` and `agentsview_send` subcommands exposed through `caption.py`.
+- [`caption_cli/agentsview.py`](/Users/alin/code/caption/caption-cli/caption_cli/agentsview.py) is not a standalone script. It powers the `sync` subcommand exposed through `caption.py`.
 
 ## Setup
 
@@ -93,19 +93,17 @@ uv run caption dl_transcript transcript-uuid --timestamp
 
 This module handles exporting and publishing agentsview session data from a local SQLite database. You do not run this file directly. You use it through:
 
-- `uv run caption agentsview_build ...`
-- `uv run caption agentsview_send ...`
+- `uv run caption sync ...`
 
 ### What it does
 
 - resolves the default data directory from `AGENT_VIEWER_DATA_DIR` or `~/.agentsview`
 - reads the local `sessions.db`
 - snapshots the SQLite database into memory before querying it
-- selects sessions with optional filters
+- selects sessions by case-insensitive partial match on the raw session ID
 - reconstructs messages, tool calls, and tool result events
 - builds share payloads
-- optionally writes payload JSON files
-- optionally sends payloads to a share server
+- either prints the payload JSON or sends payloads to a share server
 
 ### Defaults
 
@@ -113,41 +111,31 @@ This module handles exporting and publishing agentsview session data from a loca
 
 If `AGENT_VIEWER_DATA_DIR` is set, the default DB path moves under that directory.
 
-### Shared flags
+### `sync`
 
-Both agentsview commands support:
+Build share payloads from the local SQLite database and either print them or send them.
+
+```bash
+uv run caption sync --session-id s1 --test
+uv run caption sync --session-id s1 --org-id org_123
+uv run caption sync --session-id '*' --org-id org_123
+```
+
+Flags:
 
 - `--db-path`
-- `--session-id` (repeatable)
-- `--project`
-- `--agent`
-- `--started-after`
-- `--started-before`
-- `--limit`
+- `--session-id`
+- `--test`
 - `--clerk-api-key`
 - `--org-id`
 
-### `agentsview_build`
-
-Build share payloads from the local SQLite database.
-
-```bash
-uv run caption agentsview_build --project library --limit 2
-uv run caption agentsview_build --project library --limit 2 --out-dir ./shares
-```
-
 Behavior:
 
-- without `--out-dir`, prints a JSON array of payloads
-- with `--out-dir`, writes one JSON file per share ID and returns a JSON summary
-
-### `agentsview_send`
-
-Build payloads and `PUT` them to the share server.
-
-```bash
-uv run caption agentsview_send --session-id s1 --org-id org_123
-```
+- `--session-id` is required
+- matching is case-insensitive substring match against `sessions.id`
+- `--session-id '*'` selects all non-deleted sessions
+- `--test` prints the built JSON payloads and does not require send auth
+- without `--test`, the command sends payloads to `https://history.caption.fyi`
 
 This command does not require `CAPTION_API_URL` or `CAPTION_MEILI_URL`.
 
@@ -164,7 +152,7 @@ CLERK_API_KEY=token
 ORGANIZATION_ID=org_123
 ```
 
-`agentsview_send` always sends to `https://history.caption.fyi`.
+`sync` always sends to `https://history.caption.fyi` unless `--test` is used.
 
 ### Share payload shape
 

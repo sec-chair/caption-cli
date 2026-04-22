@@ -8,8 +8,6 @@ from typing import Any, Sequence
 from dotenv import load_dotenv
 
 from caption_cli.commands import (
-    command_agentsview_build,
-    command_agentsview_send,
     command_create_folder,
     command_create_project,
     command_edit_folder,
@@ -17,6 +15,7 @@ from caption_cli.commands import (
     command_list_folders,
     command_list_projects,
     command_search,
+    command_sync,
     command_token,
     dl_transcript,
 )
@@ -207,25 +206,12 @@ def _add_dl_transcript_arguments(parser: argparse.ArgumentParser) -> None:
     )
 
 
-def _add_agentsview_shared_arguments(parser: argparse.ArgumentParser) -> None:
+def _add_sync_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--db-path", default=str(default_db_path()), help="SQLite sessions database path")
-    parser.add_argument("--session-id", action="append", default=None, help="Session ID selector (repeatable)")
-    parser.add_argument("--project", default=None, help="Project selector")
-    parser.add_argument("--agent", default=None, help="Agent selector")
-    parser.add_argument("--started-after", default=None, help="Only include sessions started after this timestamp")
-    parser.add_argument("--started-before", default=None, help="Only include sessions started before this timestamp")
-    parser.add_argument("--limit", type=int, default=None, help="Maximum sessions to include")
+    parser.add_argument("--session-id", required=True, help="Case-insensitive session ID substring, or * for all")
+    parser.add_argument("--test", action="store_true", help="Build payloads locally and print JSON without sending")
     parser.add_argument("--clerk-api-key", default=None, help="Bearer token override for share requests")
     parser.add_argument("--org-id", default=None, help="Organization header override for share requests")
-
-
-def _add_agentsview_build_arguments(parser: argparse.ArgumentParser) -> None:
-    _add_agentsview_shared_arguments(parser)
-    parser.add_argument("--out-dir", default=None, help="Directory to write one JSON payload per share")
-
-
-def _add_agentsview_send_arguments(parser: argparse.ArgumentParser) -> None:
-    _add_agentsview_shared_arguments(parser)
 
 
 def _handle_token(config: RuntimeConfig, args: argparse.Namespace) -> dict[str, Any]:
@@ -291,12 +277,8 @@ def _handle_dl_transcript(config: RuntimeConfig, args: argparse.Namespace) -> An
     return dl_transcript(config, transcript_id=args.transcript_id, timestamp=args.timestamp)
 
 
-def _handle_agentsview_build(config: RuntimeConfig, args: argparse.Namespace) -> Any:
-    return command_agentsview_build(config, args)
-
-
-def _handle_agentsview_send(config: RuntimeConfig, args: argparse.Namespace) -> dict[str, object]:
-    return command_agentsview_send(config, args)
+def _handle_sync(config: RuntimeConfig, args: argparse.Namespace) -> Any:
+    return command_sync(config, args)
 
 
 def _command_specs() -> Sequence[CommandSpec]:
@@ -411,40 +393,23 @@ def _command_specs() -> Sequence[CommandSpec]:
             example="caption --output json dl_transcript <transcript-uuid>",
         ),
         CommandSpec(
-            name="agentsview_build",
-            help="Build hosted share payloads from a local agentsview SQLite database",
-            add_arguments=_add_agentsview_build_arguments,
-            handler=_handle_agentsview_build,
+            name="sync",
+            help="Build or send hosted share payloads from a local agentsview SQLite database",
+            add_arguments=_add_sync_arguments,
+            handler=_handle_sync,
             needs_api=False,
             usage=(
-                "caption agentsview_build "
-                "[--session-id ID ...] [--project NAME] [--agent NAME] [--started-after TS] "
-                "[--started-before TS] [--limit N] [--out-dir DIR]"
+                "caption sync "
+                "--session-id VALUE [--test] [--db-path PATH] [--clerk-api-key TOKEN] [--org-id ORG]"
             ),
             notes=(
-                "Reads the local SQLite database, snapshots it, and builds one share payload per session.",
-                "Share IDs use the raw session ID from the local database.",
-                "If --out-dir is omitted, outputs a JSON array of payloads.",
-            ),
-            example="caption agentsview_build --project library --limit 2 --out-dir ./shares",
-        ),
-        CommandSpec(
-            name="agentsview_send",
-            help="Send hosted share payloads to an agentsview server",
-            add_arguments=_add_agentsview_send_arguments,
-            handler=_handle_agentsview_send,
-            needs_api=False,
-            usage=(
-                "caption agentsview_send "
-                "[--session-id ID ...] [--project NAME] [--agent NAME] [--started-after TS] "
-                "[--started-before TS] [--limit N] [--clerk-api-key TOKEN] [--org-id ORG]"
-            ),
-            notes=(
-                "Builds payloads from the local SQLite DB, then PUTs them to https://history.caption.fyi/api/v1/shares/{session_id}.",
+                "Matches sessions by case-insensitive substring on the raw session ID; use * to select all sessions.",
+                "Use --test to print the built JSON payloads without sending anything.",
+                "Without --test, builds payloads from the local SQLite DB, then PUTs them to https://history.caption.fyi/api/v1/shares/{session_id}.",
                 "Auth resolves from CLI flags first, then CLERK_API_KEY and ORGANIZATION_ID from the environment.",
                 "This command does not require CAPTION_API_URL or CAPTION_MEILI_URL.",
             ),
-            example="caption agentsview_send --project library --limit 1 --org-id org_123",
+            example="caption sync --session-id s1 --org-id org_123",
         ),
     )
 

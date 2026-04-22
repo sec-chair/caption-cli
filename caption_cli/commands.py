@@ -328,9 +328,5 @@ def dl_transcript(config: RuntimeConfig, *, transcript_id: str, timestamp: bool 
     return _strip_transcript_timestamps(transcript_text)
 
 
-def command_agentsview_build(config: RuntimeConfig, args: Any) -> Any:
-    return agentsview.command_agentsview_build(config, args)
-
-
-def command_agentsview_send(config: RuntimeConfig, args: Any) -> dict[str, object]:
-    return agentsview.command_agentsview_send(config, args)
+def command_sync(config: RuntimeConfig, args: Any) -> Any:
+    return agentsview.command_sync(config, args)

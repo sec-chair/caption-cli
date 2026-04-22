@@ -123,6 +123,68 @@ def make_agentsview_db(path: Path) -> None:
         )
         conn.executemany(
             """
+            INSERT INTO sessions (
+                id, project, machine, agent, first_message, display_name,
+                started_at, ended_at, message_count, user_message_count,
+                parent_session_id, relationship_type, total_output_tokens, peak_context_tokens, deleted_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    "case-match-abc",
+                    "proj-two",
+                    "local",
+                    "codex",
+                    None,
+                    None,
+                    "2026-04-21T06:00:00Z",
+                    None,
+                    0,
+                    0,
+                    None,
+                    "",
+                    0,
+                    0,
+                    None,
+                ),
+                (
+                    "SECOND-MATCH-def",
+                    "proj-three",
+                    "local",
+                    "codex",
+                    None,
+                    None,
+                    "2026-04-21T07:00:00Z",
+                    None,
+                    0,
+                    0,
+                    None,
+                    "",
+                    0,
+                    0,
+                    None,
+                ),
+                (
+                    "other-session",
+                    "proj-four",
+                    "local",
+                    "codex",
+                    None,
+                    None,
+                    "2026-04-21T04:00:00Z",
+                    None,
+                    0,
+                    0,
+                    None,
+                    "",
+                    0,
+                    0,
+                    None,
+                ),
+            ],
+        )
+        conn.executemany(
+            """
             INSERT INTO messages (
                 id, session_id, ordinal, role, content, thinking_text, timestamp,
                 has_thinking, has_tool_use, content_length, is_system, model,
@@ -227,30 +289,36 @@ def make_agentsview_db(path: Path) -> None:
     finally:
         conn.close()
 
-def test_agentsview_commands_parse() -> None:
-    args = cli.parse_args(["agentsview_build", "--project", "library", "--limit", "2", "--out-dir", "/tmp/out"])
-    assert args.command == "agentsview_build"
-    assert args.project == "library"
-    assert args.limit == 2
-    assert args.out_dir == "/tmp/out"
+def test_sync_command_parses() -> None:
+    args = cli.parse_args(["sync", "--session-id", "abc", "--test"])
+    assert args.command == "sync"
+    assert args.session_id == "abc"
+    assert args.test is True
+    assert args.output == "json"
 
-    send_args = cli.parse_args(["agentsview_send", "--session-id", "s1", "--org-id", "org_123"])
-    assert send_args.command == "agentsview_send"
-    assert send_args.session_id == ["s1"]
+    send_args = cli.parse_args(["sync", "--session-id", "s1", "--org-id", "org_123"])
+    assert send_args.command == "sync"
+    assert send_args.session_id == "s1"
     assert send_args.org_id == "org_123"
+    assert send_args.test is False
     assert send_args.output == "json"
 
 
-def test_agentsview_removed_flags_are_rejected() -> None:
+def test_sync_requires_session_id() -> None:
     with pytest.raises(SystemExit):
-        cli.parse_args(["agentsview_build", "--config-path", "/tmp/config.toml"])
-    with pytest.raises(SystemExit):
-        cli.parse_args(["agentsview_send", "--share-url", "https://example.com"])
-    with pytest.raises(SystemExit):
-        cli.parse_args(["agentsview_send", "--publisher", "local"])
+        cli.parse_args(["sync"])
 
 
-def test_agentsview_run_does_not_require_caption_api_env(
+def test_sync_removed_flags_are_rejected() -> None:
+    with pytest.raises(SystemExit):
+        cli.parse_args(["sync", "--session-id", "s1", "--project", "proj"])
+    with pytest.raises(SystemExit):
+        cli.parse_args(["sync", "--session-id", "s1", "--limit", "2"])
+    with pytest.raises(SystemExit):
+        cli.parse_args(["sync", "--session-id", "s1", "--out-dir", "/tmp/out"])
+
+
+def test_sync_run_does_not_require_caption_api_env(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -276,13 +344,13 @@ def test_agentsview_run_does_not_require_caption_api_env(
         emitted["search_index"] = search_index
 
     monkeypatch.setattr(cli, "emit_output", fake_emit_output)
-    monkeypatch.setattr(cli, "command_agentsview_build", lambda config, args: {"ok": True, "db_path": args.db_path})
+    monkeypatch.setattr(cli, "command_sync", lambda config, args: {"ok": True, "db_path": args.db_path, "test": args.test})
 
-    exit_code = cli.run(["agentsview_build", "--db-path", str(db_path)])
+    exit_code = cli.run(["sync", "--db-path", str(db_path), "--session-id", "s1", "--test"])
 
     assert exit_code == 0
-    assert emitted["value"] == {"ok": True, "db_path": str(db_path)}
-    assert emitted["command_name"] == "agentsview_build"
+    assert emitted["value"] == {"ok": True, "db_path": str(db_path), "test": True}
+    assert emitted["command_name"] == "sync"
 
 
 def test_build_payloads_shapes_messages_and_tool_events(tmp_path: Path) -> None:
@@ -291,12 +359,7 @@ def test_build_payloads_shapes_messages_and_tool_events(tmp_path: Path) -> None:
 
     payloads = agentsview.build_payloads(
         db_path,
-        session_ids=[],
-        project="proj",
-        agent="codex",
-        started_after=None,
-        started_before=None,
-        limit=10,
+        session_id_query="s1",
     )
 
     assert len(payloads) == 1
@@ -324,6 +387,29 @@ def test_build_payloads_shapes_messages_and_tool_events(tmp_path: Path) -> None:
     assert tool_calls[1]["result_content_length"] == 4
     assert tool_calls[1]["result_events"][0]["agent_id"] == "agent-child"
     assert tool_calls[1]["result_events"][0]["content_length"] == 0
+
+
+def test_build_payloads_matches_session_ids_by_case_insensitive_substring(tmp_path: Path) -> None:
+    db_path = tmp_path / "sessions.db"
+    make_agentsview_db(db_path)
+
+    payloads = agentsview.build_payloads(db_path, session_id_query="match")
+
+    assert [payload["share_id"] for payload in payloads] == ["SECOND-MATCH-def", "case-match-abc"]
+
+
+def test_build_payloads_star_selects_all_sessions(tmp_path: Path) -> None:
+    db_path = tmp_path / "sessions.db"
+    make_agentsview_db(db_path)
+
+    payloads = agentsview.build_payloads(db_path, session_id_query="*")
+
+    assert [payload["share_id"] for payload in payloads] == [
+        "SECOND-MATCH-def",
+        "case-match-abc",
+        "s1",
+        "other-session",
+    ]
 
 
 def test_snapshot_db_reads_committed_rows_in_wal_mode(tmp_path: Path) -> None:
@@ -420,7 +506,29 @@ def test_send_payload_rejects_blank_project() -> None:
         )
 
 
-def test_command_agentsview_send_uses_env_auth_when_flags_are_omitted(
+def test_command_sync_test_mode_builds_without_auth(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "sessions.db"
+    make_agentsview_db(db_path)
+    monkeypatch.delenv("CLERK_API_KEY", raising=False)
+    monkeypatch.delenv("ORGANIZATION_ID", raising=False)
+
+    def fail_send_payloads(*args: object, **kwargs: object) -> dict[str, object]:
+        raise AssertionError("send_payloads should not be called in --test mode")
+
+    monkeypatch.setattr(agentsview, "send_payloads", fail_send_payloads)
+
+    args = cli.parse_args(["sync", "--db-path", str(db_path), "--session-id", "s1", "--test"])
+    result = agentsview.command_sync(None, args)
+
+    assert isinstance(result, list)
+    assert len(result) == 1
+    assert result[0]["share_id"] == "s1"
+
+
+def test_command_sync_uses_env_auth_when_flags_are_omitted(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -447,8 +555,8 @@ def test_command_agentsview_send_uses_env_auth_when_flags_are_omitted(
 
     monkeypatch.setattr(agentsview, "send_payloads", fake_send_payloads)
 
-    args = cli.parse_args(["agentsview_send", "--db-path", str(db_path), "--session-id", "s1"])
-    result = agentsview.command_agentsview_send(None, args)
+    args = cli.parse_args(["sync", "--db-path", str(db_path), "--session-id", "s1"])
+    result = agentsview.command_sync(None, args)
 
     assert result["sent_count"] == 1
     assert captured["base_url"] == agentsview.AGENTSVIEW_BASE_URL
@@ -464,7 +572,7 @@ def test_command_agentsview_send_uses_env_auth_when_flags_are_omitted(
     assert len(payload["messages"]) == 2
 
 
-def test_command_agentsview_send_flags_override_env(
+def test_command_sync_flags_override_env(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -490,7 +598,7 @@ def test_command_agentsview_send_flags_override_env(
 
     args = cli.parse_args(
         [
-            "agentsview_send",
+            "sync",
             "--db-path",
             str(db_path),
             "--session-id",
@@ -501,12 +609,12 @@ def test_command_agentsview_send_flags_override_env(
             "flag-org",
         ]
     )
-    agentsview.command_agentsview_send(None, args)
+    agentsview.command_sync(None, args)
 
     assert captured == {"clerk_api_key": "flag-token", "org_id": "flag-org"}
 
 
-def test_command_agentsview_send_requires_clerk_api_key(
+def test_command_sync_requires_clerk_api_key(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -515,12 +623,12 @@ def test_command_agentsview_send_requires_clerk_api_key(
     monkeypatch.delenv("CLERK_API_KEY", raising=False)
     monkeypatch.setenv("ORGANIZATION_ID", "env-org")
 
-    args = cli.parse_args(["--env-file", "", "agentsview_send", "--db-path", str(db_path), "--session-id", "s1"])
+    args = cli.parse_args(["--env-file", "", "sync", "--db-path", str(db_path), "--session-id", "s1"])
     with pytest.raises(core.CliError, match=r"Missing Clerk API key \(--clerk-api-key or CLERK_API_KEY\)"):
-        agentsview.command_agentsview_send(None, args)
+        agentsview.command_sync(None, args)
 
 
-def test_command_agentsview_send_requires_organization_id(
+def test_command_sync_requires_organization_id(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -529,12 +637,12 @@ def test_command_agentsview_send_requires_organization_id(
     monkeypatch.setenv("CLERK_API_KEY", "env-token")
     monkeypatch.delenv("ORGANIZATION_ID", raising=False)
 
-    args = cli.parse_args(["--env-file", "", "agentsview_send", "--db-path", str(db_path), "--session-id", "s1"])
+    args = cli.parse_args(["--env-file", "", "sync", "--db-path", str(db_path), "--session-id", "s1"])
     with pytest.raises(core.CliError, match=r"Missing org id \(--org-id or ORGANIZATION_ID\)"):
-        agentsview.command_agentsview_send(None, args)
+        agentsview.command_sync(None, args)
 
 
-def test_agentsview_send_uses_env_file_for_auth(
+def test_sync_uses_env_file_for_auth(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -580,7 +688,7 @@ def test_agentsview_send_uses_env_file_for_auth(
         [
             "--env-file",
             str(env_file),
-            "agentsview_send",
+            "sync",
             "--db-path",
             str(db_path),
             "--session-id",
@@ -595,4 +703,4 @@ def test_agentsview_send_uses_env_file_for_auth(
         "org_id": "file-org",
     }
     assert emitted["format"] == "json"
-    assert emitted["command_name"] == "agentsview_send"
+    assert emitted["command_name"] == "sync"
