@@ -5,6 +5,7 @@ from typing import Any, Callable, Mapping
 
 import meilisearch
 
+from caption_cli import agentsview
 from caption_cli.core import (
     CliError,
     RuntimeConfig,
@@ -325,3 +326,11 @@ def dl_transcript(config: RuntimeConfig, *, transcript_id: str, timestamp: bool 
     if timestamp:
         return transcript_text
     return _strip_transcript_timestamps(transcript_text)
+
+
+def command_agentsview_build(config: RuntimeConfig, args: Any) -> Any:
+    return agentsview.command_agentsview_build(config, args)
+
+
+def command_agentsview_send(config: RuntimeConfig, args: Any) -> dict[str, object]:
+    return agentsview.command_agentsview_send(config, args)

@@ -8,6 +8,8 @@ from typing import Any, Sequence
 from dotenv import load_dotenv
 
 from caption_cli.commands import (
+    command_agentsview_build,
+    command_agentsview_send,
     command_create_folder,
     command_create_project,
     command_edit_folder,
@@ -18,6 +20,7 @@ from caption_cli.commands import (
     command_token,
     dl_transcript,
 )
+from caption_cli.agentsview import default_config_path, default_db_path
 from caption_cli.core import (
     CliError,
     CommandSpec,
@@ -36,8 +39,8 @@ DEFAULT_ENV_FILE = Path(__file__).resolve().parents[1] / ".env"
 def _top_level_help_epilog(specs: Sequence[CommandSpec]) -> str:
     lines = [
         "Environment",
-        "  CAPTION_API_URL   required for all commands",
-        "  CLERK_API_KEY     required for authenticated API calls",
+        "  CAPTION_API_URL   required for Caption API commands",
+        "  CLERK_API_KEY     required for authenticated Caption API calls",
         "  CAPTION_MEILI_URL required for token and search",
         "",
         "Global options",
@@ -109,7 +112,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     args = parser.parse_args(argv)
     if args.output is None:
         args.output = command_specs[args.command].default_output
-    if hasattr(args, "limit") and args.limit < 1:
+    if hasattr(args, "limit") and args.limit is not None and args.limit < 1:
         raise CliError("--limit must be >= 1")
 
     return args
@@ -204,6 +207,30 @@ def _add_dl_transcript_arguments(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _add_agentsview_shared_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--db-path", default=str(default_db_path()), help="SQLite sessions database path")
+    parser.add_argument("--config-path", default=str(default_config_path()), help="Agentsview TOML config path")
+    parser.add_argument("--session-id", action="append", default=None, help="Session ID selector (repeatable)")
+    parser.add_argument("--project", default=None, help="Project selector")
+    parser.add_argument("--agent", default=None, help="Agent selector")
+    parser.add_argument("--started-after", default=None, help="Only include sessions started after this timestamp")
+    parser.add_argument("--started-before", default=None, help="Only include sessions started before this timestamp")
+    parser.add_argument("--limit", type=int, default=None, help="Maximum sessions to include")
+    parser.add_argument("--share-url", default=None, help="Share server base URL override")
+    parser.add_argument("--clerk-api-key", default=None, help="Bearer token override for share requests")
+    parser.add_argument("--org-id", default=None, help="Organization header override for share requests")
+    parser.add_argument("--publisher", default=None, help="Publisher prefix for share IDs")
+
+
+def _add_agentsview_build_arguments(parser: argparse.ArgumentParser) -> None:
+    _add_agentsview_shared_arguments(parser)
+    parser.add_argument("--out-dir", default=None, help="Directory to write one JSON payload per share")
+
+
+def _add_agentsview_send_arguments(parser: argparse.ArgumentParser) -> None:
+    _add_agentsview_shared_arguments(parser)
+
+
 def _handle_token(config: RuntimeConfig, args: argparse.Namespace) -> dict[str, Any]:
     return command_token(config, show_token=args.show_token)
 
@@ -265,6 +292,14 @@ def _handle_edit_folder(config: RuntimeConfig, args: argparse.Namespace) -> dict
 
 def _handle_dl_transcript(config: RuntimeConfig, args: argparse.Namespace) -> Any:
     return dl_transcript(config, transcript_id=args.transcript_id, timestamp=args.timestamp)
+
+
+def _handle_agentsview_build(config: RuntimeConfig, args: argparse.Namespace) -> Any:
+    return command_agentsview_build(config, args)
+
+
+def _handle_agentsview_send(config: RuntimeConfig, args: argparse.Namespace) -> dict[str, object]:
+    return command_agentsview_send(config, args)
 
 
 def _command_specs() -> Sequence[CommandSpec]:
@@ -378,6 +413,43 @@ def _command_specs() -> Sequence[CommandSpec]:
             ),
             example="caption --output json dl_transcript <transcript-uuid>",
         ),
+        CommandSpec(
+            name="agentsview_build",
+            help="Build hosted share payloads from a local agentsview SQLite database",
+            add_arguments=_add_agentsview_build_arguments,
+            handler=_handle_agentsview_build,
+            needs_api=False,
+            usage=(
+                "caption agentsview_build "
+                "[--session-id ID ...] [--project NAME] [--agent NAME] [--started-after TS] "
+                "[--started-before TS] [--limit N] [--out-dir DIR]"
+            ),
+            notes=(
+                "Reads the local SQLite database, snapshots it, and builds one share payload per session.",
+                "Publisher resolves from --publisher first, then [share].publisher in --config-path.",
+                "If --out-dir is omitted, outputs a JSON array of payloads.",
+            ),
+            example="caption agentsview_build --project library --limit 2 --out-dir ./shares",
+        ),
+        CommandSpec(
+            name="agentsview_send",
+            help="Send hosted share payloads to an agentsview server",
+            add_arguments=_add_agentsview_send_arguments,
+            handler=_handle_agentsview_send,
+            needs_api=False,
+            usage=(
+                "caption agentsview_send "
+                "[--session-id ID ...] [--project NAME] [--agent NAME] [--started-after TS] "
+                "[--started-before TS] [--limit N] [--share-url URL] [--clerk-api-key TOKEN] "
+                "[--org-id ORG] [--publisher NAME]"
+            ),
+            notes=(
+                "Builds payloads from the local SQLite DB, then PUTs them to /api/v1/shares/{publisher}:{session_id}.",
+                "Share settings resolve from CLI flags first, then [share] values in --config-path.",
+                "This command does not require CAPTION_API_URL or CAPTION_MEILI_URL.",
+            ),
+            example="caption agentsview_send --project library --limit 1 --share-url https://library.caption.fyi --org-id org_123",
+        ),
     )
 
 
@@ -395,7 +467,8 @@ def run(argv: Sequence[str] | None = None) -> int:
         cache_path=Path(args.cache_path),
         output=args.output,
     )
-    _require_api_url(config)
+    if selected_command.needs_api:
+        _require_api_url(config)
     if selected_command.needs_meili:
         _require_meili_url(config)
 

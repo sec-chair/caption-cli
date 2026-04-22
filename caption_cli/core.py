@@ -80,6 +80,7 @@ class CommandSpec:
     help: str
     add_arguments: Callable[[argparse.ArgumentParser], None]
     handler: Callable[[RuntimeConfig, argparse.Namespace], Any]
+    needs_api: bool = True
     needs_meili: bool = False
     default_output: str = "json"
     usage: str = ""
