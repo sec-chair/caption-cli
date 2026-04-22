@@ -20,7 +20,7 @@ from caption_cli.commands import (
     command_token,
     dl_transcript,
 )
-from caption_cli.agentsview import default_config_path, default_db_path
+from caption_cli.agentsview import default_db_path
 from caption_cli.core import (
     CliError,
     CommandSpec,
@@ -209,17 +209,14 @@ def _add_dl_transcript_arguments(parser: argparse.ArgumentParser) -> None:
 
 def _add_agentsview_shared_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--db-path", default=str(default_db_path()), help="SQLite sessions database path")
-    parser.add_argument("--config-path", default=str(default_config_path()), help="Agentsview TOML config path")
     parser.add_argument("--session-id", action="append", default=None, help="Session ID selector (repeatable)")
     parser.add_argument("--project", default=None, help="Project selector")
     parser.add_argument("--agent", default=None, help="Agent selector")
     parser.add_argument("--started-after", default=None, help="Only include sessions started after this timestamp")
     parser.add_argument("--started-before", default=None, help="Only include sessions started before this timestamp")
     parser.add_argument("--limit", type=int, default=None, help="Maximum sessions to include")
-    parser.add_argument("--share-url", default=None, help="Share server base URL override")
     parser.add_argument("--clerk-api-key", default=None, help="Bearer token override for share requests")
     parser.add_argument("--org-id", default=None, help="Organization header override for share requests")
-    parser.add_argument("--publisher", default=None, help="Publisher prefix for share IDs")
 
 
 def _add_agentsview_build_arguments(parser: argparse.ArgumentParser) -> None:
@@ -426,7 +423,7 @@ def _command_specs() -> Sequence[CommandSpec]:
             ),
             notes=(
                 "Reads the local SQLite database, snapshots it, and builds one share payload per session.",
-                "Publisher resolves from --publisher first, then [share].publisher in --config-path.",
+                "Share IDs use the raw session ID from the local database.",
                 "If --out-dir is omitted, outputs a JSON array of payloads.",
             ),
             example="caption agentsview_build --project library --limit 2 --out-dir ./shares",
@@ -440,15 +437,14 @@ def _command_specs() -> Sequence[CommandSpec]:
             usage=(
                 "caption agentsview_send "
                 "[--session-id ID ...] [--project NAME] [--agent NAME] [--started-after TS] "
-                "[--started-before TS] [--limit N] [--share-url URL] [--clerk-api-key TOKEN] "
-                "[--org-id ORG] [--publisher NAME]"
+                "[--started-before TS] [--limit N] [--clerk-api-key TOKEN] [--org-id ORG]"
             ),
             notes=(
-                "Builds payloads from the local SQLite DB, then PUTs them to /api/v1/shares/{publisher}:{session_id}.",
-                "Share settings resolve from CLI flags first, then [share] values in --config-path.",
+                "Builds payloads from the local SQLite DB, then PUTs them to https://history.caption.fyi/api/v1/shares/{session_id}.",
+                "Auth resolves from CLI flags first, then CLERK_API_KEY and ORGANIZATION_ID from the environment.",
                 "This command does not require CAPTION_API_URL or CAPTION_MEILI_URL.",
             ),
-            example="caption agentsview_send --project library --limit 1 --share-url https://library.caption.fyi --org-id org_123",
+            example="caption agentsview_send --project library --limit 1 --org-id org_123",
         ),
     )
 

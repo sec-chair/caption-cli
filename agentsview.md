@@ -46,12 +46,11 @@
   - HTTP request tests
 
 ## Command Surface
-- `caption agentsview_build [selectors...] [share options...] [--out-dir DIR]`
-- `caption agentsview_send [selectors...] [share options...]`
+- `caption agentsview_build [selectors...] [--out-dir DIR]`
+- `caption agentsview_send [selectors...] [auth options...]`
 
 Shared selectors:
 - `--db-path PATH`
-- `--config-path PATH`
 - `--session-id SESSION_ID` repeatable
 - `--project PROJECT`
 - `--agent AGENT`
@@ -59,11 +58,9 @@ Shared selectors:
 - `--started-before ISO8601`
 - `--limit N`
 
-Shared share-config overrides:
-- `--share-url URL`
+Shared auth overrides:
 - `--clerk-api-key TOKEN`
 - `--org-id ORG_ID`
-- `--publisher NAME`
 
 Build-only options:
 - `--out-dir DIR`
@@ -76,22 +73,15 @@ Output rules:
 - Do not add a new global output format just for NDJSON in v1. If someone actually needs NDJSON later, add it after there is a real consumer.
 
 ## Config Loading
-- Read share config from TOML using stdlib `tomllib`.
-- Expected section:
-
-```toml
-[share]
-url = "https://share.example.com"
-clerk_api_key = "clerk_api_key"
-org = "org_123"
-publisher = "machine-or-publisher"
-```
-
-- Resolution order:
+- Do not read share settings from `config.toml`.
+- Hard-code the send target URL to `https://history.caption.fyi`.
+- Resolve auth as:
   - explicit CLI flag
-  - `config.toml` `[share]` value
+  - environment variable loaded from `.env` or the shell
   - otherwise fail with `CliError`
-- Normalize URL with `rstrip("/")`.
+- Environment variable names:
+  - `CLERK_API_KEY`
+  - `ORGANIZATION_ID`
 - `clerk_api_key` is not a special share token. It is the normal authenticated API credential used on `/api/*`.
 
 ## Auth Contract
@@ -125,7 +115,7 @@ sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
   - load messages ordered by `ordinal ASC`
   - load `tool_calls` ordered by `tool_calls.id`
   - load `tool_result_events` ordered by `tool_call_message_ordinal, call_index, event_index`
-  - attach each event to `message.tool_calls[call_index]`
+- attach each event to `message.tool_calls[call_index]`
 - Do not attach tool result events by `tool_use_id`. The draft was right about that part: positional `call_index` is the rule that matters here.
 
 ## Query Shape
@@ -202,7 +192,7 @@ Selector application:
 
 - Request semantics that matter:
   - treat `share_id` as globally unique across the deployment, not just within one org
-  - build it as `{publisher}:{local_session_id}` to avoid collisions
+  - build it as the raw local session ID
   - `session.project` is effectively required even though the server currently fails with `500 {"error":"internal error"}` instead of a clean `400`
   - `messages` is a full replacement set; omitting it or sending `[]` deletes previously stored messages for that share
   - `session.id` can still carry the original local session ID for debugging, but the server ignores it for persistence
@@ -309,8 +299,8 @@ def encode_tool_call(row: sqlite3.Row, result_events: list[dict[str, object]]) -
 ```
 
 ```python
-def build_share_payload(session_row: sqlite3.Row, publisher: str, messages: list[dict[str, object]]) -> dict[str, object]:
-    share_id = f"{publisher}:{session_row['id']}"
+def build_share_payload(session_row: sqlite3.Row, messages: list[dict[str, object]]) -> dict[str, object]:
+    share_id = str(session_row["id"])
     return {
         "share_id": share_id,
         "session": {
@@ -356,7 +346,6 @@ def send_payload(base_url: str, clerk_api_key: str, org_id: str, share_id: str, 
 ```
 
 Notes:
-- Do not URL-escape the colon in `publisher:session_id` unless the server proves it requires it. The current contract is the literal path shape shown above.
 - Use `json=payload` unless byte-for-byte parity testing proves the server depends on custom separators. Don’t cargo-cult serialization tweaks without evidence.
 - Keep `share_id` in the body equal to the path even though the handler treats it as optional. Optional here is not a reason to create two sources of truth.
 - Expect full-upsert behavior: the latest snapshot wins.
@@ -415,7 +404,7 @@ Do not split this into four tiny modules on day one. One focused `caption_cli/ag
 
 - HTTP tests:
   - verify `PUT`
-  - verify path `/api/v1/shares/{publisher}:{session_id}`
+  - verify path `/api/v1/shares/{session_id}`
   - verify bearer auth header
   - verify `X-Agentsview-Org`
   - verify `Content-Type: application/json` is sent even though the server does not enforce it

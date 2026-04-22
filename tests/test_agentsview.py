@@ -227,11 +227,6 @@ def make_agentsview_db(path: Path) -> None:
     finally:
         conn.close()
 
-
-def write_config(path: Path, body: str) -> None:
-    path.write_text(body, encoding="utf-8")
-
-
 def test_agentsview_commands_parse() -> None:
     args = cli.parse_args(["agentsview_build", "--project", "library", "--limit", "2", "--out-dir", "/tmp/out"])
     assert args.command == "agentsview_build"
@@ -246,14 +241,21 @@ def test_agentsview_commands_parse() -> None:
     assert send_args.output == "json"
 
 
+def test_agentsview_removed_flags_are_rejected() -> None:
+    with pytest.raises(SystemExit):
+        cli.parse_args(["agentsview_build", "--config-path", "/tmp/config.toml"])
+    with pytest.raises(SystemExit):
+        cli.parse_args(["agentsview_send", "--share-url", "https://example.com"])
+    with pytest.raises(SystemExit):
+        cli.parse_args(["agentsview_send", "--publisher", "local"])
+
+
 def test_agentsview_run_does_not_require_caption_api_env(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     db_path = tmp_path / "sessions.db"
     db_path.touch()
-    config_path = tmp_path / "config.toml"
-    write_config(config_path, "[share]\npublisher = 'pub'\n")
 
     monkeypatch.delenv("CAPTION_API_URL", raising=False)
     monkeypatch.delenv("CAPTION_MEILI_URL", raising=False)
@@ -276,7 +278,7 @@ def test_agentsview_run_does_not_require_caption_api_env(
     monkeypatch.setattr(cli, "emit_output", fake_emit_output)
     monkeypatch.setattr(cli, "command_agentsview_build", lambda config, args: {"ok": True, "db_path": args.db_path})
 
-    exit_code = cli.run(["agentsview_build", "--db-path", str(db_path), "--config-path", str(config_path)])
+    exit_code = cli.run(["agentsview_build", "--db-path", str(db_path)])
 
     assert exit_code == 0
     assert emitted["value"] == {"ok": True, "db_path": str(db_path)}
@@ -289,7 +291,6 @@ def test_build_payloads_shapes_messages_and_tool_events(tmp_path: Path) -> None:
 
     payloads = agentsview.build_payloads(
         db_path,
-        publisher="pub",
         session_ids=[],
         project="proj",
         agent="codex",
@@ -300,7 +301,7 @@ def test_build_payloads_shapes_messages_and_tool_events(tmp_path: Path) -> None:
 
     assert len(payloads) == 1
     payload = payloads[0]
-    assert payload["share_id"] == "pub:s1"
+    assert payload["share_id"] == "s1"
     assert payload["session"]["first_message"] is None
     assert payload["session"]["display_name"] is None
     assert payload["session"]["parent_session_id"] is None
@@ -347,14 +348,14 @@ def test_snapshot_db_reads_committed_rows_in_wal_mode(tmp_path: Path) -> None:
 
 def test_send_payload_uses_expected_request_contract() -> None:
     payload = {
-        "share_id": "pub:s1",
+        "share_id": "s1",
         "session": {"id": "s1", "project": "proj", "agent": "codex", "message_count": 1, "user_message_count": 1},
         "messages": [],
     }
 
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.method == "PUT"
-        assert str(request.url) == "https://library.caption.fyi/api/v1/shares/pub:s1"
+        assert str(request.url) == "https://history.caption.fyi/api/v1/shares/s1"
         assert request.headers["Authorization"] == "Bearer test-token"
         assert request.headers["X-Agentsview-Org"] == "org_123"
         assert request.headers["Content-Type"] == "application/json"
@@ -364,10 +365,10 @@ def test_send_payload_uses_expected_request_contract() -> None:
 
     transport = httpx.MockTransport(handler)
     agentsview.send_payload(
-        "https://library.caption.fyi",
+        agentsview.AGENTSVIEW_BASE_URL,
         "test-token",
         "org_123",
-        "pub:s1",
+        "s1",
         payload,
         transport=transport,
     )
@@ -384,7 +385,7 @@ def test_send_payload_uses_expected_request_contract() -> None:
 )
 def test_send_payload_surfaces_server_errors(status_code: int, body: str, match: str) -> None:
     payload = {
-        "share_id": "pub:s1",
+        "share_id": "s1",
         "session": {"id": "s1", "project": "proj", "agent": "codex", "message_count": 1, "user_message_count": 1},
         "messages": [],
     }
@@ -392,10 +393,10 @@ def test_send_payload_surfaces_server_errors(status_code: int, body: str, match:
     transport = httpx.MockTransport(lambda request: httpx.Response(status_code=status_code, text=body))
     with pytest.raises(core.CliError, match=match):
         agentsview.send_payload(
-            "https://library.caption.fyi",
+            agentsview.AGENTSVIEW_BASE_URL,
             "test-token",
             "org_123",
-            "pub:s1",
+            "s1",
             payload,
             transport=transport,
         )
@@ -403,17 +404,195 @@ def test_send_payload_surfaces_server_errors(status_code: int, body: str, match:
 
 def test_send_payload_rejects_blank_project() -> None:
     payload = {
-        "share_id": "pub:s1",
+        "share_id": "s1",
         "session": {"id": "s1", "project": "   ", "agent": "codex", "message_count": 1, "user_message_count": 1},
         "messages": [],
     }
 
     with pytest.raises(core.CliError, match="blank session.project"):
         agentsview.send_payload(
-            "https://library.caption.fyi",
+            agentsview.AGENTSVIEW_BASE_URL,
             "test-token",
             "org_123",
-            "pub:s1",
+            "s1",
             payload,
             transport=httpx.MockTransport(lambda request: httpx.Response(status_code=204)),
         )
+
+
+def test_command_agentsview_send_uses_env_auth_when_flags_are_omitted(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "sessions.db"
+    make_agentsview_db(db_path)
+    monkeypatch.setenv("CLERK_API_KEY", "env-token")
+    monkeypatch.setenv("ORGANIZATION_ID", "env-org")
+    captured: dict[str, object] = {}
+
+    def fake_send_payloads(
+        payloads: list[dict[str, object]],
+        *,
+        base_url: str,
+        clerk_api_key: str,
+        org_id: str,
+        transport: httpx.BaseTransport | None = None,
+    ) -> dict[str, object]:
+        captured["payloads"] = payloads
+        captured["base_url"] = base_url
+        captured["clerk_api_key"] = clerk_api_key
+        captured["org_id"] = org_id
+        captured["transport"] = transport
+        return {"sent_count": len(payloads), "failed_count": 0, "sent": [], "failures": []}
+
+    monkeypatch.setattr(agentsview, "send_payloads", fake_send_payloads)
+
+    args = cli.parse_args(["agentsview_send", "--db-path", str(db_path), "--session-id", "s1"])
+    result = agentsview.command_agentsview_send(None, args)
+
+    assert result["sent_count"] == 1
+    assert captured["base_url"] == agentsview.AGENTSVIEW_BASE_URL
+    assert captured["clerk_api_key"] == "env-token"
+    assert captured["org_id"] == "env-org"
+    payloads = captured["payloads"]
+    assert isinstance(payloads, list)
+    assert len(payloads) == 1
+    payload = payloads[0]
+    assert payload["share_id"] == "s1"
+    assert payload["session"]["id"] == "s1"
+    assert payload["session"]["project"] == "proj"
+    assert len(payload["messages"]) == 2
+
+
+def test_command_agentsview_send_flags_override_env(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "sessions.db"
+    make_agentsview_db(db_path)
+    monkeypatch.setenv("CLERK_API_KEY", "env-token")
+    monkeypatch.setenv("ORGANIZATION_ID", "env-org")
+    captured: dict[str, str] = {}
+
+    def fake_send_payloads(
+        payloads: list[dict[str, object]],
+        *,
+        base_url: str,
+        clerk_api_key: str,
+        org_id: str,
+        transport: httpx.BaseTransport | None = None,
+    ) -> dict[str, object]:
+        captured["clerk_api_key"] = clerk_api_key
+        captured["org_id"] = org_id
+        return {"sent_count": len(payloads), "failed_count": 0, "sent": [], "failures": []}
+
+    monkeypatch.setattr(agentsview, "send_payloads", fake_send_payloads)
+
+    args = cli.parse_args(
+        [
+            "agentsview_send",
+            "--db-path",
+            str(db_path),
+            "--session-id",
+            "s1",
+            "--clerk-api-key",
+            "flag-token",
+            "--org-id",
+            "flag-org",
+        ]
+    )
+    agentsview.command_agentsview_send(None, args)
+
+    assert captured == {"clerk_api_key": "flag-token", "org_id": "flag-org"}
+
+
+def test_command_agentsview_send_requires_clerk_api_key(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "sessions.db"
+    make_agentsview_db(db_path)
+    monkeypatch.delenv("CLERK_API_KEY", raising=False)
+    monkeypatch.setenv("ORGANIZATION_ID", "env-org")
+
+    args = cli.parse_args(["--env-file", "", "agentsview_send", "--db-path", str(db_path), "--session-id", "s1"])
+    with pytest.raises(core.CliError, match=r"Missing Clerk API key \(--clerk-api-key or CLERK_API_KEY\)"):
+        agentsview.command_agentsview_send(None, args)
+
+
+def test_command_agentsview_send_requires_organization_id(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "sessions.db"
+    make_agentsview_db(db_path)
+    monkeypatch.setenv("CLERK_API_KEY", "env-token")
+    monkeypatch.delenv("ORGANIZATION_ID", raising=False)
+
+    args = cli.parse_args(["--env-file", "", "agentsview_send", "--db-path", str(db_path), "--session-id", "s1"])
+    with pytest.raises(core.CliError, match=r"Missing org id \(--org-id or ORGANIZATION_ID\)"):
+        agentsview.command_agentsview_send(None, args)
+
+
+def test_agentsview_send_uses_env_file_for_auth(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "sessions.db"
+    make_agentsview_db(db_path)
+    env_file = tmp_path / ".env"
+    env_file.write_text("CLERK_API_KEY=file-token\nORGANIZATION_ID=file-org\n", encoding="utf-8")
+    monkeypatch.delenv("CLERK_API_KEY", raising=False)
+    monkeypatch.delenv("ORGANIZATION_ID", raising=False)
+    monkeypatch.delenv("CAPTION_API_URL", raising=False)
+    monkeypatch.delenv("CAPTION_MEILI_URL", raising=False)
+    emitted: dict[str, object] = {}
+    captured: dict[str, str] = {}
+
+    def fake_emit_output(
+        value: object,
+        output_format: str,
+        *,
+        command_name: str | None = None,
+        search_index: str | None = None,
+    ) -> None:
+        emitted["value"] = value
+        emitted["format"] = output_format
+        emitted["command_name"] = command_name
+
+    def fake_send_payloads(
+        payloads: list[dict[str, object]],
+        *,
+        base_url: str,
+        clerk_api_key: str,
+        org_id: str,
+        transport: httpx.BaseTransport | None = None,
+    ) -> dict[str, object]:
+        captured["base_url"] = base_url
+        captured["clerk_api_key"] = clerk_api_key
+        captured["org_id"] = org_id
+        return {"sent_count": len(payloads), "failed_count": 0, "sent": [], "failures": []}
+
+    monkeypatch.setattr(cli, "emit_output", fake_emit_output)
+    monkeypatch.setattr(agentsview, "send_payloads", fake_send_payloads)
+
+    exit_code = cli.run(
+        [
+            "--env-file",
+            str(env_file),
+            "agentsview_send",
+            "--db-path",
+            str(db_path),
+            "--session-id",
+            "s1",
+        ]
+    )
+
+    assert exit_code == 0
+    assert captured == {
+        "base_url": agentsview.AGENTSVIEW_BASE_URL,
+        "clerk_api_key": "file-token",
+        "org_id": "file-org",
+    }
+    assert emitted["format"] == "json"
+    assert emitted["command_name"] == "agentsview_send"

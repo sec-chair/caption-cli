@@ -4,14 +4,14 @@ import argparse
 import json
 import os
 import sqlite3
-import tomllib
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Mapping
+from typing import Any, Iterable
 
 import httpx
 
 from caption_cli.core import CliError
+
+AGENTSVIEW_BASE_URL = "https://history.caption.fyi"
 
 SESSION_SQL = """
 SELECT
@@ -60,14 +60,6 @@ ORDER BY tool_call_message_ordinal, call_index, event_index
 """
 
 
-@dataclass(frozen=True, slots=True)
-class ShareSettings:
-    url: str | None
-    clerk_api_key: str | None
-    org_id: str | None
-    publisher: str | None
-
-
 def default_data_dir() -> Path:
     override = os.getenv("AGENT_VIEWER_DATA_DIR")
     if override and override.strip():
@@ -77,10 +69,6 @@ def default_data_dir() -> Path:
 
 def default_db_path() -> Path:
     return default_data_dir() / "sessions.db"
-
-
-def default_config_path() -> Path:
-    return default_data_dir() / "config.toml"
 
 
 def _clean_optional(value: str | None, label: str) -> str | None:
@@ -96,75 +84,6 @@ def _require_value(value: str | None, label: str) -> str:
     if value is None or not value.strip():
         raise CliError(f"Missing {label}")
     return value.strip()
-
-
-def _load_share_section(config_path: Path) -> Mapping[str, Any]:
-    if not config_path.exists():
-        return {}
-
-    try:
-        with config_path.open("rb") as fh:
-            payload = tomllib.load(fh)
-    except OSError as exc:
-        raise CliError(f"Failed reading config file {config_path}: {exc}") from exc
-    except tomllib.TOMLDecodeError as exc:
-        raise CliError(f"Failed parsing config file {config_path}: {exc}") from exc
-
-    share_section = payload.get("share")
-    if share_section is None:
-        return {}
-    if not isinstance(share_section, dict):
-        raise CliError(f"{config_path} [share] must be a TOML table")
-    return share_section
-
-
-def load_share_settings(
-    config_path: Path,
-    *,
-    share_url: str | None,
-    clerk_api_key: str | None,
-    org_id: str | None,
-    publisher: str | None,
-) -> ShareSettings:
-    share_section = _load_share_section(config_path)
-
-    config_url = share_section.get("url")
-    config_clerk_api_key = share_section.get("clerk_api_key")
-    if not isinstance(config_clerk_api_key, str) or not config_clerk_api_key.strip():
-        fallback_token = share_section.get("token")
-        if isinstance(fallback_token, str) and fallback_token.strip():
-            config_clerk_api_key = fallback_token
-    config_org_id = share_section.get("org")
-    if not isinstance(config_org_id, str) or not config_org_id.strip():
-        fallback_org_id = share_section.get("org_id")
-        if isinstance(fallback_org_id, str) and fallback_org_id.strip():
-            config_org_id = fallback_org_id
-    config_publisher = share_section.get("publisher")
-
-    resolved_url = _clean_optional(share_url, "--share-url")
-    if resolved_url is None and isinstance(config_url, str) and config_url.strip():
-        resolved_url = config_url.strip()
-    if resolved_url is not None:
-        resolved_url = resolved_url.rstrip("/")
-
-    resolved_clerk_api_key = _clean_optional(clerk_api_key, "--clerk-api-key")
-    if resolved_clerk_api_key is None and isinstance(config_clerk_api_key, str) and config_clerk_api_key.strip():
-        resolved_clerk_api_key = config_clerk_api_key.strip()
-
-    resolved_org_id = _clean_optional(org_id, "--org-id")
-    if resolved_org_id is None and isinstance(config_org_id, str) and config_org_id.strip():
-        resolved_org_id = config_org_id.strip()
-
-    resolved_publisher = _clean_optional(publisher, "--publisher")
-    if resolved_publisher is None and isinstance(config_publisher, str) and config_publisher.strip():
-        resolved_publisher = config_publisher.strip()
-
-    return ShareSettings(
-        url=resolved_url,
-        clerk_api_key=resolved_clerk_api_key,
-        org_id=resolved_org_id,
-        publisher=resolved_publisher,
-    )
 
 
 def snapshot_db(db_path: Path) -> sqlite3.Connection:
@@ -371,7 +290,6 @@ def encode_message(row: sqlite3.Row, tool_calls: list[dict[str, object]]) -> dic
 def build_payload_for_session(
     conn: sqlite3.Connection,
     session_row: sqlite3.Row,
-    publisher: str,
 ) -> dict[str, object]:
     messages = load_messages(conn, str(session_row["id"]))
     message_ids = [int(row["id"]) for row in messages]
@@ -389,7 +307,7 @@ def build_payload_for_session(
             encoded_tool_calls.append(encode_tool_call(tool_call_row, encoded_events))
         encoded_messages.append(encode_message(message_row, encoded_tool_calls))
 
-    share_id = f"{publisher}:{session_row['id']}"
+    share_id = str(session_row["id"])
     return {
         "share_id": share_id,
         "session": {
@@ -414,7 +332,6 @@ def build_payload_for_session(
 def build_payloads(
     db_path: Path,
     *,
-    publisher: str,
     session_ids: list[str],
     project: str | None,
     agent: str | None,
@@ -433,7 +350,7 @@ def build_payloads(
             started_before=started_before,
             limit=limit,
         )
-        return [build_payload_for_session(conn, session_row, publisher) for session_row in session_rows]
+        return [build_payload_for_session(conn, session_row) for session_row in session_rows]
     finally:
         conn.close()
 
@@ -539,18 +456,9 @@ def _clean_optional_arg(value: str | None, label: str) -> str | None:
     return _clean_optional(value, label)
 
 
-def _build_payloads_from_args(args: argparse.Namespace) -> tuple[list[dict[str, object]], ShareSettings]:
-    share_settings = load_share_settings(
-        Path(args.config_path).expanduser(),
-        share_url=args.share_url,
-        clerk_api_key=args.clerk_api_key,
-        org_id=args.org_id,
-        publisher=args.publisher,
-    )
-    publisher = _require_value(share_settings.publisher, "share publisher (--publisher or [share].publisher)")
+def _build_payloads_from_args(args: argparse.Namespace) -> list[dict[str, object]]:
     payloads = build_payloads(
         Path(args.db_path).expanduser(),
-        publisher=publisher,
         session_ids=_clean_session_ids(args.session_id),
         project=_clean_optional_arg(args.project, "--project"),
         agent=_clean_optional_arg(args.agent, "--agent"),
@@ -558,11 +466,11 @@ def _build_payloads_from_args(args: argparse.Namespace) -> tuple[list[dict[str, 
         started_before=_clean_optional_arg(args.started_before, "--started-before"),
         limit=args.limit,
     )
-    return payloads, share_settings
+    return payloads
 
 
 def command_agentsview_build(_: Any, args: argparse.Namespace) -> object:
-    payloads, _ = _build_payloads_from_args(args)
+    payloads = _build_payloads_from_args(args)
     if args.out_dir is None:
         return payloads
 
@@ -575,16 +483,18 @@ def command_agentsview_build(_: Any, args: argparse.Namespace) -> object:
 
 
 def command_agentsview_send(_: Any, args: argparse.Namespace) -> dict[str, object]:
-    payloads, share_settings = _build_payloads_from_args(args)
-    base_url = _require_value(share_settings.url, "share URL (--share-url or [share].url)")
+    payloads = _build_payloads_from_args(args)
     clerk_api_key = _require_value(
-        share_settings.clerk_api_key,
-        "Clerk API key (--clerk-api-key or [share].clerk_api_key)",
+        _clean_optional(args.clerk_api_key, "--clerk-api-key") or os.getenv("CLERK_API_KEY"),
+        "Clerk API key (--clerk-api-key or CLERK_API_KEY)",
     )
-    org_id = _require_value(share_settings.org_id, "org id (--org-id or [share].org)")
+    org_id = _require_value(
+        _clean_optional(args.org_id, "--org-id") or os.getenv("ORGANIZATION_ID"),
+        "org id (--org-id or ORGANIZATION_ID)",
+    )
     return send_payloads(
         payloads,
-        base_url=base_url,
+        base_url=AGENTSVIEW_BASE_URL,
         clerk_api_key=clerk_api_key,
         org_id=org_id,
     )

@@ -110,26 +110,22 @@ This module handles exporting and publishing agentsview session data from a loca
 ### Defaults
 
 - default DB path: `~/.agentsview/sessions.db`
-- default config path: `~/.agentsview/config.toml`
 
-If `AGENT_VIEWER_DATA_DIR` is set, both defaults move under that directory.
+If `AGENT_VIEWER_DATA_DIR` is set, the default DB path moves under that directory.
 
 ### Shared flags
 
 Both agentsview commands support:
 
 - `--db-path`
-- `--config-path`
 - `--session-id` (repeatable)
 - `--project`
 - `--agent`
 - `--started-after`
 - `--started-before`
 - `--limit`
-- `--share-url`
 - `--clerk-api-key`
 - `--org-id`
-- `--publisher`
 
 ### `agentsview_build`
 
@@ -150,33 +146,25 @@ Behavior:
 Build payloads and `PUT` them to the share server.
 
 ```bash
-uv run caption agentsview_send --session-id s1 --share-url https://library.caption.fyi --org-id org_123 --publisher local
+uv run caption agentsview_send --session-id s1 --org-id org_123
 ```
 
 This command does not require `CAPTION_API_URL` or `CAPTION_MEILI_URL`.
 
-### Config file
-
-`agentsview_send` and `agentsview_build` can read share settings from TOML:
-
-```toml
-[share]
-url = "https://library.caption.fyi"
-clerk_api_key = "token"
-org = "org_123"
-publisher = "local"
-```
-
-Resolution order is:
+Auth resolution:
 
 1. CLI flag
-2. `[share]` value from `--config-path`
+2. environment variable from `.env` or the shell
 3. failure with `CliError` if a required send setting is still missing
 
-The code also accepts fallback keys:
+Relevant auth variables:
 
-- `token` as a fallback for `clerk_api_key`
-- `org_id` as a fallback for `org`
+```dotenv
+CLERK_API_KEY=token
+ORGANIZATION_ID=org_123
+```
+
+`agentsview_send` always sends to `https://history.caption.fyi`.
 
 ### Share payload shape
 
@@ -189,10 +177,8 @@ Each built payload includes:
 `share_id` is built as:
 
 ```text
-{publisher}:{session_id}
+{session_id}
 ```
-
-That is deliberate. Without the publisher prefix, collisions are predictable.
 
 ### Development
 
