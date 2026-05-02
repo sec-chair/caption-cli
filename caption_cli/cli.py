@@ -404,8 +404,9 @@ def _handle_doctor(config: RuntimeConfig, args: argparse.Namespace) -> Any:
     return command_doctor(config, args)
 
 
-def render_doctor_output(features: Sequence[str]) -> str:
-    lines = ["CAPTION FEATURES AVAILABLE:"]
+def render_doctor_output(features: Sequence[str], organization_id: str | None) -> str:
+    organization = organization_id if organization_id is not None else "None"
+    lines = [f"ORGANIZATION: {organization}", "CAPTION FEATURES AVAILABLE:"]
     lines.extend(feature for feature in ("core", "agentsview") if feature in features)
     return "\n".join(lines)
 
@@ -641,7 +642,7 @@ def run(argv: Sequence[str] | None = None) -> int:
 
     result = selected_command.handler(config, args)
     if args.command == "doctor":
-        print(render_doctor_output(result))
+        print(render_doctor_output(result, os.getenv("ORGANIZATION_ID")))
         return 0
 
     output_file = args.output_file
