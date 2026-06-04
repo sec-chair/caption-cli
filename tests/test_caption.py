@@ -265,17 +265,21 @@ def test_search_command_defaults_to_captions_index_and_limit() -> None:
     assert args.command == "search"
     assert args.query == "term"
     assert args.index == core.DEFAULT_SEARCH_INDEX
-    assert args.limit == core.DEFAULT_LIMIT == 5
+    assert args.limit == core.DEFAULT_LIMIT
+    assert args.show_dupes is False
     assert args.output == "table"
 
 
 def test_search_command_accepts_positional_query_and_index_uid() -> None:
-    args = cli.parse_args(["search", "term", "--index", "projects_v1", "--limit", "7"])
+    args = cli.parse_args(
+        ["search", "term", "--index", "projects_v1", "--limit", "7", "--show-dupes"]
+    )
 
     assert args.command == "search"
     assert args.query == "term"
     assert args.index == "projects_v1"
     assert args.limit == 7
+    assert args.show_dupes is True
 
 
 def test_search_help_lists_supported_indices(capsys: pytest.CaptureFixture[str]) -> None:
@@ -469,6 +473,82 @@ def test_command_search_uses_index_search_endpoint_shape(
     assert search_calls == [("roadmap", {"limit": 7})]
 
 
+def test_command_search_dedupes_hits_by_project_id(
+    monkeypatch: pytest.MonkeyPatch,
+    config: core.RuntimeConfig,
+) -> None:
+    write_cache(config.cache_path)
+
+    class FakeIndex:
+        def search(self, query, opt_params=None):
+            return {
+                "hits": [
+                    {"id": "caption-1", "projectId": "project-1"},
+                    {"id": "caption-2", "projectId": "project-1"},
+                    {"id": "session-1", "scope": {"projectId": "project-2"}},
+                    {
+                        "id": "caption-3",
+                        "projectId": "project-2",
+                        "scope": {"projectId": "legacy-project"},
+                    },
+                    {"id": "projectless-1"},
+                    {"id": "projectless-2"},
+                ],
+                "estimatedTotalHits": 6,
+            }
+
+    class FakeClient:
+        def index(self, index_uid):
+            return FakeIndex()
+
+    monkeypatch.setattr(core, "build_meili_client", lambda url, token: FakeClient())
+
+    result = commands.command_search(
+        config, query="roadmap", index="transcript_captions_v1", limit=10
+    )
+
+    assert [hit["id"] for hit in result["hits"]] == [
+        "caption-1",
+        "session-1",
+        "projectless-1",
+        "projectless-2",
+    ]
+    assert result["estimatedTotalHits"] == 6
+
+
+def test_command_search_show_dupes_skips_project_id_dedupe(
+    monkeypatch: pytest.MonkeyPatch,
+    config: core.RuntimeConfig,
+) -> None:
+    write_cache(config.cache_path)
+
+    class FakeIndex:
+        def search(self, query, opt_params=None):
+            return {
+                "hits": [
+                    {"id": "caption-1", "projectId": "project-1"},
+                    {"id": "caption-2", "projectId": "project-1"},
+                ],
+                "estimatedTotalHits": 2,
+            }
+
+    class FakeClient:
+        def index(self, index_uid):
+            return FakeIndex()
+
+    monkeypatch.setattr(core, "build_meili_client", lambda url, token: FakeClient())
+
+    result = commands.command_search(
+        config,
+        query="roadmap",
+        index="transcript_captions_v1",
+        limit=10,
+        show_dupes=True,
+    )
+
+    assert [hit["id"] for hit in result["hits"]] == ["caption-1", "caption-2"]
+
+
 def test_command_search_rejects_empty_index(
     config: core.RuntimeConfig,
 ) -> None:
@@ -564,9 +644,67 @@ def test_run_search_uses_default_index_when_flag_omitted(
     assert exit_code == 0
     assert index_calls == [core.DEFAULT_SEARCH_INDEX]
     assert emitted["format"] == "table"
-    assert emitted["value"] == {"hits": [{"query": "term", "limit": 5}]}
+    assert emitted["value"] == {"hits": [{"query": "term", "limit": core.DEFAULT_LIMIT}]}
     assert emitted["command_name"] == "search"
     assert emitted["search_index"] == core.DEFAULT_SEARCH_INDEX
+
+
+def test_run_search_show_dupes_passes_flag_to_command(
+    monkeypatch: pytest.MonkeyPatch,
+    config: core.RuntimeConfig,
+) -> None:
+    set_runtime_env(monkeypatch, meili_url=config.meili_url)
+    captured: dict[str, object] = {}
+
+    def fake_command_search(
+        runtime_config: core.RuntimeConfig,
+        query: str,
+        index: str,
+        limit: int,
+        *,
+        show_dupes: bool,
+    ) -> dict[str, object]:
+        captured["config"] = runtime_config
+        captured["query"] = query
+        captured["index"] = index
+        captured["limit"] = limit
+        captured["show_dupes"] = show_dupes
+        return {"hits": []}
+
+    monkeypatch.setattr(cli, "command_search", fake_command_search)
+    emitted = install_emit_output_capture(monkeypatch)
+
+    exit_code = cli.run(
+        [
+            "--env-file",
+            "",
+            "--cache-path",
+            str(config.cache_path),
+            "search",
+            "term",
+            "--index",
+            "projects_v1",
+            "--limit",
+            "7",
+            "--show-dupes",
+        ]
+    )
+
+    assert exit_code == 0
+    assert captured == {
+        "config": core.RuntimeConfig(
+            api_url="http://localhost:8000",
+            api_token="api-token",
+            meili_url="https://configured.meili",
+            cache_path=config.cache_path,
+            output="table",
+        ),
+        "query": "term",
+        "index": "projects_v1",
+        "limit": 7,
+        "show_dupes": True,
+    }
+    assert emitted["value"] == {"hits": []}
 
 
 def test_command_list_projects_fetches_workspace_and_all_projects(
@@ -1051,9 +1189,10 @@ def test_emit_output_search_table_for_transcript_captions_uses_condensed_columns
         "hits": [
             {
                 "id": "caption-hit-id",
+                "projectId": "project-uuid-1",
                 "updatedAt": "2026-02-09T18:41:33.097Z",
                 "format": 1.1,
-                "scope": {"workspaceId": "w-uuid", "folderIds": [], "projectId": "project-uuid-1"},
+                "scope": {"workspaceId": "w-uuid", "folderIds": [], "projectId": "legacy-scope-project"},
                 "sessionId": "session-uuid",
                 "speaker": {"id": "speaker-uuid-1", "name": "0:0"},
                 "content": "patent work before and a lot of the money",
@@ -1066,13 +1205,41 @@ def test_emit_output_search_table_for_transcript_captions_uses_condensed_columns
     core.emit_output(payload, "table", command_name="search", search_index="transcript_captions_v1")
     out = capsys.readouterr().out
 
-    assert "estimatedTotalHits: 1 | returned: 1" in out
-    assert "| # | scope.projectId (uuid) | speaker.name | updatedAt (YYYYMMDD) | content |" in out
+    assert "TotalHits: 1 | returned: 1" in out
+    assert "| # | projectId (uuid) | speaker.name | updatedAt (YYYYMMDD) | content |" in out
     assert "project-uuid-1" in out
+    assert "legacy-scope-project" not in out
     assert "20260209" in out
     assert "speaker.id" not in out
     assert "sessionId" not in out
     assert "createdAt" not in out
+
+
+def test_emit_output_search_table_for_transcript_sessions_uses_project_id(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    payload = {
+        "hits": [
+            {
+                "id": "session-hit-id",
+                "projectId": "project-uuid-2",
+                "updatedAt": "2026-02-10T18:41:33.097Z",
+                "scope": {"workspaceId": "w-uuid", "folderIds": [], "projectId": "legacy-scope-project"},
+                "speakers": ["Microphone", "Loopback"],
+                "content": "patent application",
+            }
+        ],
+        "estimatedTotalHits": 1,
+    }
+
+    core.emit_output(payload, "table", command_name="search", search_index="transcript_sessions_v1")
+    out = capsys.readouterr().out
+
+    assert "| # | projectId (uuid) | updatedAt (YYYYMMDD) | speakers | content |" in out
+    assert "project-uuid-2" in out
+    assert "legacy-scope-project" not in out
+    assert "20260210" in out
+    assert "Microphone, Loopback" in out
 
 
 def test_emit_output_search_table_for_projects_uses_condensed_columns(
@@ -1095,7 +1262,7 @@ def test_emit_output_search_table_for_projects_uses_condensed_columns(
     core.emit_output(payload, "table", command_name="search", search_index="projects_v1")
     out = capsys.readouterr().out
 
-    assert "estimatedTotalHits: 1 | returned: 1" in out
+    assert "TotalHits: 1 | returned: 1" in out
     assert "| # | id (project uuid) | updatedAt (YYYYMMDD) | name | description |" in out
     assert "project-uuid-1" in out
     assert "20260209" in out

@@ -10,7 +10,7 @@ import httpx
 import meilisearch
 
 DEFAULT_CACHE_PATH = "search-token.json"
-DEFAULT_LIMIT = 5
+DEFAULT_LIMIT = 1000
 DEFAULT_SEARCH_INDEX = "transcript_captions_v1"
 WORKSPACE_LIST_PAGE_SIZE = 100
 PROJECT_OUTPUT_FIELDS = (
@@ -57,7 +57,9 @@ class SearchToken:
         raw_url = payload.get("url")
         url = raw_url if isinstance(raw_url, str) and raw_url else None
         raw_expires = payload.get("expiresAt")
-        expires_at = raw_expires if isinstance(raw_expires, str) and raw_expires else None
+        expires_at = (
+            raw_expires if isinstance(raw_expires, str) and raw_expires else None
+        )
         return cls(token=token, url=url, expires_at=expires_at)
 
     def to_payload(self) -> dict[str, Any]:
@@ -92,7 +94,6 @@ class CommandSpec:
     example: str = ""
 
 
-
 def fetch_search_token(api_url: str, api_token: str) -> SearchToken:
     url = f"{api_url.rstrip('/')}/search/token"
     headers = {"Authorization": f"Bearer {api_token}"}
@@ -101,7 +102,9 @@ def fetch_search_token(api_url: str, api_token: str) -> SearchToken:
 
     if response.status_code >= 400:
         detail = response.text.strip() or response.reason_phrase
-        raise CliError(f"Failed to fetch search token ({response.status_code}): {detail}")
+        raise CliError(
+            f"Failed to fetch search token ({response.status_code}): {detail}"
+        )
 
     payload = response.json()
     if not isinstance(payload, dict):
@@ -121,7 +124,9 @@ def _authorized_request(
     url = f"{api_url.rstrip('/')}/{path.lstrip('/')}"
     headers = {"Authorization": f"Bearer {api_token}"}
     with httpx.Client(timeout=15.0) as client:
-        response = client.request(method, url, headers=headers, params=params, json=json_body)
+        response = client.request(
+            method, url, headers=headers, params=params, json=json_body
+        )
 
     if expected_statuses is None:
         is_error = response.status_code >= 400
@@ -129,7 +134,9 @@ def _authorized_request(
         is_error = response.status_code not in expected_statuses
     if is_error:
         detail = response.text.strip() or response.reason_phrase
-        raise CliError(f"Failed {method.upper()} {path} ({response.status_code}): {detail}")
+        raise CliError(
+            f"Failed {method.upper()} {path} ({response.status_code}): {detail}"
+        )
 
     payload = response.json()
     if not isinstance(payload, dict):
@@ -252,7 +259,9 @@ def load_cached_search_token(cache_path: Path) -> SearchToken | None:
 
 def save_search_token(cache_path: Path, search_token: SearchToken) -> None:
     cache_path.parent.mkdir(parents=True, exist_ok=True)
-    cache_path.write_text(json.dumps(search_token.to_payload(), indent=2) + "\n", encoding="utf-8")
+    cache_path.write_text(
+        json.dumps(search_token.to_payload(), indent=2) + "\n", encoding="utf-8"
+    )
 
 
 def _require_api_url(config: RuntimeConfig) -> str:
@@ -288,11 +297,17 @@ def _is_meili_auth_error(err: Exception) -> bool:
         return True
 
     code = getattr(err, "code", None)
-    if isinstance(code, str) and code in {"invalid_api_key", "missing_authorization_header"}:
+    if isinstance(code, str) and code in {
+        "invalid_api_key",
+        "missing_authorization_header",
+    }:
         return True
 
     message = _stringify_error(err).lower()
-    return any(token in message for token in ("invalid_api_key", "api key", "unauthorized", "forbidden"))
+    return any(
+        token in message
+        for token in ("invalid_api_key", "api key", "unauthorized", "forbidden")
+    )
 
 
 def _require_api_token(config: RuntimeConfig) -> str:
@@ -354,11 +369,16 @@ def _render_table(value: Any, *, command_name: str | None = None) -> str:
             lines.append(f"count: {len(items)}")
             if not items:
                 return "\n".join(lines)
-            columns = list(COMMAND_TABLE_FIELDS.get(command_name, tuple(items[0].keys())))
+            columns = list(
+                COMMAND_TABLE_FIELDS.get(command_name, tuple(items[0].keys()))
+            )
             lines.append("\t".join(columns))
             for item in items:
                 lines.append(
-                    "\t".join("" if item.get(column) is None else str(item.get(column)) for column in columns)
+                    "\t".join(
+                        "" if item.get(column) is None else str(item.get(column))
+                        for column in columns
+                    )
                 )
             return "\n".join(lines)
 
@@ -400,8 +420,17 @@ def _to_yyyymmdd(value: Any) -> str:
     return ""
 
 
-def _search_summary_header(value: Mapping[str, Any], hits: Sequence[Mapping[str, Any]]) -> list[str]:
-    return [f"estimatedTotalHits: {value.get('estimatedTotalHits')} | returned: {len(hits)}"]
+def _search_summary_header(
+    value: Mapping[str, Any], hits: Sequence[Mapping[str, Any]]
+) -> list[str]:
+    return [f"hits: {value.get('estimatedTotalHits')} | unique: {len(hits)}"]
+
+
+def _project_id_from_search_hit(hit: Mapping[str, Any]) -> Any:
+    if hit.get("projectId") is not None:
+        return hit.get("projectId")
+    scope = hit.get("scope") if isinstance(hit.get("scope"), dict) else {}
+    return scope.get("projectId")
 
 
 def _render_search_summary_table(value: Any, index_uid: str | None) -> str:
@@ -418,14 +447,15 @@ def _render_search_summary_table(value: Any, index_uid: str | None) -> str:
         return "\n".join(lines)
 
     if index_uid == "transcript_captions_v1":
-        lines.append("| # | scope.projectId (uuid) | speaker.name | updatedAt (YYYYMMDD) | content |")
+        lines.append(
+            "| # | projectId (uuid) | speaker.name | updatedAt (YYYYMMDD) | content |"
+        )
         lines.append("|---:|---|---|---|---|")
         for i, hit in enumerate(hits, start=1):
-            scope = hit.get("scope") if isinstance(hit.get("scope"), dict) else {}
             speaker = hit.get("speaker") if isinstance(hit.get("speaker"), dict) else {}
             row = [
                 str(i),
-                _cell(scope.get("projectId")),
+                _cell(_project_id_from_search_hit(hit)),
                 _cell(speaker.get("name")),
                 _cell(_to_yyyymmdd(hit.get("updatedAt"))),
                 _cell(_truncate_for_cell(hit.get("content", ""))),
@@ -434,15 +464,20 @@ def _render_search_summary_table(value: Any, index_uid: str | None) -> str:
         return "\n".join(lines)
 
     if index_uid == "transcript_sessions_v1":
-        lines.append("| # | scope.projectId (uuid) | updatedAt (YYYYMMDD) | speakers | content |")
+        lines.append(
+            "| # | projectId (uuid) | updatedAt (YYYYMMDD) | speakers | content |"
+        )
         lines.append("|---:|---|---|---|---|")
         for i, hit in enumerate(hits, start=1):
-            scope = hit.get("scope") if isinstance(hit.get("scope"), dict) else {}
             speakers_value = hit.get("speakers")
-            speakers = ", ".join(str(item) for item in speakers_value) if isinstance(speakers_value, list) else ""
+            speakers = (
+                ", ".join(str(item) for item in speakers_value)
+                if isinstance(speakers_value, list)
+                else ""
+            )
             row = [
                 str(i),
-                _cell(scope.get("projectId")),
+                _cell(_project_id_from_search_hit(hit)),
                 _cell(_to_yyyymmdd(hit.get("updatedAt"))),
                 _cell(_truncate_for_cell(speakers, limit=40)),
                 _cell(_truncate_for_cell(hit.get("content", ""))),
@@ -451,10 +486,16 @@ def _render_search_summary_table(value: Any, index_uid: str | None) -> str:
         return "\n".join(lines)
 
     if index_uid == "projects_v1":
-        lines.append("| # | id (project uuid) | updatedAt (YYYYMMDD) | name | description |")
+        lines.append(
+            "| # | id (project uuid) | updatedAt (YYYYMMDD) | name | description |"
+        )
         lines.append("|---:|---|---|---|---|")
         for i, hit in enumerate(hits, start=1):
-            description = "" if hit.get("description") is None else _truncate_for_cell(hit.get("description", ""), limit=60)
+            description = (
+                ""
+                if hit.get("description") is None
+                else _truncate_for_cell(hit.get("description", ""), limit=60)
+            )
             row = [
                 str(i),
                 _cell(hit.get("id")),
@@ -478,7 +519,11 @@ def render_output(
 ) -> str:
     if output_format == "json":
         return json.dumps(value, indent=2)
-    if output_format == "md" and command_name == "get_md" and isinstance(value, Mapping):
+    if (
+        output_format == "md"
+        and command_name == "get_md"
+        and isinstance(value, Mapping)
+    ):
         raw_markdown = value.get("raw_markdown")
         if isinstance(raw_markdown, str):
             return raw_markdown

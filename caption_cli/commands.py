@@ -41,7 +41,14 @@ def command_token(config: RuntimeConfig, *, show_token: bool = False) -> dict[st
     }
 
 
-def command_search(config: RuntimeConfig, query: str, index: str, limit: int) -> dict[str, Any]:
+def command_search(
+    config: RuntimeConfig,
+    query: str,
+    index: str,
+    limit: int,
+    *,
+    show_dupes: bool = False,
+) -> dict[str, Any]:
     resolved_index = index.strip()
     if not resolved_index:
         raise CliError("--index cannot be empty")
@@ -49,9 +56,51 @@ def command_search(config: RuntimeConfig, query: str, index: str, limit: int) ->
     token_payload = _require_cached_or_fresh_token(config)
 
     def _operation(client: meilisearch.Client) -> dict[str, Any]:
-        return client.index(resolved_index).search(query, {"limit": limit})
+        result = client.index(resolved_index).search(query, {"limit": limit})
+        if show_dupes:
+            return result
+        return _dedupe_search_result_by_project_id(result)
 
     return _run_with_single_auth_retry(config, _operation, token_payload)
+
+
+def _search_hit_project_id(hit: Mapping[str, Any]) -> str | None:
+    project_id = hit.get("projectId")
+    if project_id is None or project_id == "":
+        scope = hit.get("scope") if isinstance(hit.get("scope"), dict) else {}
+        project_id = scope.get("projectId")
+    if project_id is None or project_id == "":
+        return None
+    return str(project_id)
+
+
+def _dedupe_search_result_by_project_id(result: dict[str, Any]) -> dict[str, Any]:
+    raw_hits = result.get("hits")
+    if not isinstance(raw_hits, list):
+        return result
+
+    seen_project_ids: set[str] = set()
+    deduped_hits: list[Any] = []
+    changed = False
+    for hit in raw_hits:
+        if not isinstance(hit, dict):
+            deduped_hits.append(hit)
+            continue
+
+        project_id = _search_hit_project_id(hit)
+        if project_id is None:
+            deduped_hits.append(hit)
+            continue
+        if project_id in seen_project_ids:
+            changed = True
+            continue
+
+        seen_project_ids.add(project_id)
+        deduped_hits.append(hit)
+
+    if not changed:
+        return result
+    return {**result, "hits": deduped_hits}
 
 
 def _command_list_workspace_items(

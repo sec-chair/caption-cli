@@ -192,6 +192,11 @@ def _add_search_arguments(parser: argparse.ArgumentParser) -> None:
         ),
     )
     parser.add_argument("--limit", type=int, default=DEFAULT_LIMIT, help=f"Maximum results (default: {DEFAULT_LIMIT})")
+    parser.add_argument(
+        "--show-dupes",
+        action="store_true",
+        help="Show duplicate hits instead of deduping search results by projectId",
+    )
 
 
 def _add_create_project_arguments(parser: argparse.ArgumentParser) -> None:
@@ -322,7 +327,13 @@ def _handle_token(config: RuntimeConfig, args: argparse.Namespace) -> dict[str, 
 
 
 def _handle_search(config: RuntimeConfig, args: argparse.Namespace) -> dict[str, Any]:
-    return command_search(config, query=args.query, index=args.index, limit=args.limit)
+    return command_search(
+        config,
+        query=args.query,
+        index=args.index,
+        limit=args.limit,
+        show_dupes=args.show_dupes,
+    )
 
 
 def _handle_list_projects(config: RuntimeConfig, _: argparse.Namespace) -> dict[str, Any]:
@@ -448,7 +459,7 @@ def _command_specs() -> Sequence[CommandSpec]:
             handler=_handle_search,
             needs_meili=True,
             default_output="table",
-            usage="caption search <query> [--index INDEX] [--limit N]",
+            usage="caption search <query> [--index INDEX] [--limit N] [--show-dupes]",
             notes=(
                 "--limit must be >= 1.",
                 "Uses cached token and refreshes once on Meili auth failures.",
