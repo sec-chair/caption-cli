@@ -114,7 +114,13 @@ def test_doctor_command_reports_both_features(monkeypatch: pytest.MonkeyPatch, c
     monkeypatch.setattr(commands.agentsview, "_agentsview_json", fake_agentsview_json)
     args = cli.parse_args(["--env-file", "", "doctor", "--clerk-api-key", "history-token", "--org-id", "org_123"])
 
-    assert commands.command_doctor(config, args) == ["core", "agentsview"]
+    result = commands.command_doctor(config, args)
+    assert result["features"] == ["core", "agentsview"]
+    assert result["organization"] == "org_123"
+    assert result["probes"] == [
+        {"name": "core", "available": True, "reason": None},
+        {"name": "agentsview", "available": True, "reason": None},
+    ]
 
 
 def test_doctor_command_omits_core_when_caption_returns_non_uuid(
@@ -125,7 +131,11 @@ def test_doctor_command_omits_core_when_caption_returns_non_uuid(
     monkeypatch.setattr(commands.agentsview, "_agentsview_json", lambda *args, **kwargs: {"documents": []})
     args = cli.parse_args(["--env-file", "", "doctor", "--clerk-api-key", "history-token", "--org-id", "org_123"])
 
-    assert commands.command_doctor(config, args) == ["agentsview"]
+    result = commands.command_doctor(config, args)
+    assert result["features"] == ["agentsview"]
+    core_probe = result["probes"][0]
+    assert core_probe["available"] is False
+    assert "non-UUID" in core_probe["reason"]
 
 
 @pytest.mark.parametrize(
@@ -147,7 +157,11 @@ def test_doctor_command_omits_core_when_caption_probe_raises(
     monkeypatch.setattr(commands.agentsview, "_agentsview_json", lambda *args, **kwargs: {"documents": []})
     args = cli.parse_args(["--env-file", "", "doctor", "--clerk-api-key", "history-token", "--org-id", "org_123"])
 
-    assert commands.command_doctor(config, args) == ["agentsview"]
+    result = commands.command_doctor(config, args)
+    assert result["features"] == ["agentsview"]
+    core_probe = result["probes"][0]
+    assert core_probe["available"] is False
+    assert "caption failed" in core_probe["reason"]
 
 
 def test_doctor_command_omits_agentsview_without_documents(
@@ -162,7 +176,11 @@ def test_doctor_command_omits_agentsview_without_documents(
     monkeypatch.setattr(commands.agentsview, "_agentsview_json", lambda *args, **kwargs: {"items": []})
     args = cli.parse_args(["--env-file", "", "doctor", "--clerk-api-key", "history-token", "--org-id", "org_123"])
 
-    assert commands.command_doctor(config, args) == ["core"]
+    result = commands.command_doctor(config, args)
+    assert result["features"] == ["core"]
+    agentsview_probe = result["probes"][1]
+    assert agentsview_probe["available"] is False
+    assert "documents" in agentsview_probe["reason"]
 
 
 @pytest.mark.parametrize(
@@ -189,7 +207,188 @@ def test_doctor_command_omits_agentsview_when_probe_raises(
     monkeypatch.setattr(commands.agentsview, "_agentsview_json", fake_agentsview_json)
     args = cli.parse_args(["--env-file", "", "doctor", "--clerk-api-key", "history-token", "--org-id", "org_123"])
 
-    assert commands.command_doctor(config, args) == ["core"]
+    result = commands.command_doctor(config, args)
+    assert result["features"] == ["core"]
+    agentsview_probe = result["probes"][1]
+    assert agentsview_probe["available"] is False
+    assert "agentsview failed" in agentsview_probe["reason"]
+
+
+def _install_fake_doctor(monkeypatch: pytest.MonkeyPatch, *, core_ok: bool, agentsview_ok: bool) -> None:
+    def fake_command_doctor(config: core.RuntimeConfig, args: object) -> dict[str, object]:
+        probes = [
+            {"name": "core", "available": core_ok, "reason": None if core_ok else "Missing Caption API URL. Set CAPTION_API_URL"},
+            {"name": "agentsview", "available": agentsview_ok, "reason": None if agentsview_ok else "history server unreachable: boom"},
+        ]
+        return {
+            "organization": "org_123",
+            "features": [probe["name"] for probe in probes if probe["available"]],
+            "probes": probes,
+        }
+
+    monkeypatch.setattr(cli, "command_doctor", fake_command_doctor)
+
+
+def test_run_doctor_failed_probe_reports_reason_on_stderr_but_exits_zero(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _install_fake_doctor(monkeypatch, core_ok=False, agentsview_ok=True)
+
+    exit_code = cli.run(["--env-file", "", "doctor"])
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert "doctor: probe 'core' failed: Missing Caption API URL" in captured.err
+    assert "ORGANIZATION: org_123" in captured.out
+    assert "agentsview" in captured.out
+
+
+def test_run_doctor_strict_exits_nonzero_when_probe_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _install_fake_doctor(monkeypatch, core_ok=False, agentsview_ok=False)
+
+    exit_code = cli.run(["--env-file", "", "doctor", "--strict"])
+
+    captured = capsys.readouterr()
+    assert exit_code != 0
+    assert "doctor: probe 'core' failed" in captured.err
+    assert "doctor: probe 'agentsview' failed" in captured.err
+
+
+def test_run_doctor_json_output_is_structured_and_parseable(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _install_fake_doctor(monkeypatch, core_ok=True, agentsview_ok=True)
+
+    exit_code = cli.run(["--env-file", "", "--output", "json", "doctor"])
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    payload = json.loads(captured.out)
+    assert payload["organization"] == "org_123"
+    assert payload["features"] == ["core", "agentsview"]
+    assert payload["probes"][0] == {"name": "core", "available": True, "reason": None}
+    assert captured.err == ""
+
+
+def test_run_capabilities_emits_machine_readable_contract_offline(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    for env_var in ("CAPTION_API_URL", "CLERK_API_KEY", "CAPTION_MEILI_URL", "ORGANIZATION_ID"):
+        monkeypatch.delenv(env_var, raising=False)
+
+    exit_code = cli.run(["--env-file", "", "capabilities"])
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    payload = json.loads(captured.out)
+    assert payload["tool"] == "caption"
+    assert payload["contract_version"]
+    command_names = [command["name"] for command in payload["commands"]]
+    assert "capabilities" in command_names
+    assert "doctor" in command_names
+    assert "search" in command_names
+    assert payload["exit_codes"]["0"]
+    assert payload["exit_codes"]["2"]
+    assert "CAPTION_API_URL" in payload["env_vars"]
+    assert "AGENT_VIEWER_DATA_DIR" in payload["env_vars"]
+    search_command = next(command for command in payload["commands"] if command["name"] == "search")
+    assert search_command["usage"].startswith("caption search")
+    assert search_command["default_output"] == "table"
+
+
+def test_capabilities_defaults_to_json_output() -> None:
+    assert cli.parse_args(["capabilities"]).output == "json"
+
+
+def test_list_projects_full_returns_raw_payload_without_note(
+    monkeypatch: pytest.MonkeyPatch,
+    config: core.RuntimeConfig,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    raw_item = {
+        "id": "p1",
+        "name": "Alpha",
+        "transcript": None,
+        "createdAt": "2024-01-01",
+        "updatedAt": "2024-01-02",
+        "folder": None,
+        "description": None,
+        "extraServerField": "kept-only-in-full",
+    }
+    monkeypatch.setattr(commands, "fetch_current_workspace_id", lambda api_url, api_token: "w-uuid")
+    monkeypatch.setattr(commands, "fetch_workspace_items", lambda *args, **kwargs: [dict(raw_item)])
+
+    condensed = commands.command_list_projects(config)
+    condensed_err = capsys.readouterr().err
+    assert "extraServerField" not in condensed["items"][0]
+    assert "condensed view" in condensed_err
+    assert "--full" in condensed_err
+
+    full = commands.command_list_projects(config, full=True)
+    full_err = capsys.readouterr().err
+    assert full["items"][0]["extraServerField"] == "kept-only-in-full"
+    assert full_err == ""
+
+
+def test_exit_code_dictionary_missing_config_maps_to_exit_config() -> None:
+    empty_config = core.RuntimeConfig(
+        api_url=None, api_token=None, meili_url=None, cache_path=Path("unused"), output="json"
+    )
+    with pytest.raises(core.CliError) as excinfo:
+        core._require_api_url(empty_config)
+    assert excinfo.value.exit_code == core.EXIT_CONFIG
+
+    with pytest.raises(core.CliError) as excinfo:
+        core._require_api_token(empty_config)
+    assert excinfo.value.exit_code == core.EXIT_CONFIG
+
+    with pytest.raises(core.CliError) as excinfo:
+        core._require_meili_url(empty_config)
+    assert excinfo.value.exit_code == core.EXIT_CONFIG
+
+
+def test_exit_code_dictionary_maps_remote_statuses() -> None:
+    assert core._exit_code_for_status(404) == core.EXIT_NOT_FOUND
+    assert core._exit_code_for_status(500) == core.EXIT_UPSTREAM
+    assert core._exit_code_for_status(401) == core.EXIT_UPSTREAM
+
+    not_found_transport = httpx.MockTransport(lambda request: httpx.Response(404, text="nope"))
+    with pytest.raises(core.CliError) as excinfo:
+        commands.agentsview._agentsview_request(
+            "GET",
+            "/api/v1/md/missing-doc",
+            auth=("key", "org"),
+            expected_statuses={200},
+            transport=not_found_transport,
+        )
+    assert excinfo.value.exit_code == core.EXIT_NOT_FOUND
+
+    server_error_transport = httpx.MockTransport(lambda request: httpx.Response(500, text="boom"))
+    with pytest.raises(core.CliError) as excinfo:
+        commands.agentsview._agentsview_request(
+            "GET",
+            "/api/v1/md",
+            auth=("key", "org"),
+            expected_statuses={200},
+            transport=server_error_transport,
+        )
+    assert excinfo.value.exit_code == core.EXIT_UPSTREAM
+
+
+def test_top_level_help_documents_exit_codes(capsys: pytest.CaptureFixture[str]) -> None:
+    with pytest.raises(SystemExit):
+        cli.parse_args(["-h"])
+
+    output = capsys.readouterr().out
+    assert "Exit codes" in output
+    assert "configuration error" in output
+    assert "upstream failure" in output
 
 
 def test_extract_object_list_accepts_current_items_response() -> None:
@@ -391,6 +590,66 @@ def test_dl_transcript_accepts_timestamp_flag() -> None:
     assert args.timestamp is True
 
 
+def test_unknown_flag_typo_suggests_correction_and_subcommand_usage(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    with pytest.raises(SystemExit) as excinfo:
+        cli.parse_args(["search", "term", "--liimt", "5"])
+
+    captured = capsys.readouterr()
+    assert excinfo.value.code == 2
+    assert "did you mean --limit?" in captured.err
+    assert "usage: caption search" in captured.err
+    assert "for 'caption search'" in captured.err
+
+
+def test_unknown_flag_underscore_spelling_suggests_dashed_flag(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    with pytest.raises(SystemExit) as excinfo:
+        cli.parse_args(["token", "--show_token"])
+
+    captured = capsys.readouterr()
+    assert excinfo.value.code == 2
+    assert "did you mean --show-token?" in captured.err
+    assert "usage: caption token" in captured.err
+
+
+def test_unknown_flag_abbreviation_suggests_full_flag(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    with pytest.raises(SystemExit) as excinfo:
+        cli.parse_args(["search", "term", "--lim", "5"])
+
+    assert excinfo.value.code == 2
+    assert "did you mean --limit?" in capsys.readouterr().err
+
+
+def test_global_flag_after_subcommand_teaches_placement(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    with pytest.raises(SystemExit) as excinfo:
+        cli.parse_args(["search", "term", "--output", "json"])
+
+    captured = capsys.readouterr()
+    assert excinfo.value.code == 2
+    assert "global flag and must come before the subcommand" in captured.err
+    assert "did you mean --output?" not in captured.err
+
+
+def test_unknown_flag_without_close_match_lists_valid_flags(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    with pytest.raises(SystemExit) as excinfo:
+        cli.parse_args(["search", "term", "--jsno"])
+
+    captured = capsys.readouterr()
+    assert excinfo.value.code == 2
+    assert "Valid flags:" in captured.err
+    assert "--output" in captured.err
+    assert "--limit" in captured.err
+
+
 def test_removed_global_flags_are_rejected() -> None:
     with pytest.raises(SystemExit):
         cli.parse_args(["--api-url", "http://localhost:8000", "list_projects"])
@@ -427,6 +686,190 @@ def test_top_level_help_contains_single_page_cheat_sheet(capsys: pytest.CaptureF
         assert command_name in output
     assert "usage: caption search <query> [--index INDEX] [--limit N]" in output
     assert "example: caption --output json dl_transcript <transcript-uuid>" in output
+
+
+def test_create_project_dry_run_returns_request_preview_offline(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    for env_var in ("CAPTION_API_URL", "CLERK_API_KEY"):
+        monkeypatch.delenv(env_var, raising=False)
+
+    exit_code = cli.run(["--env-file", "", "create_project", "Demo", "--description", "d", "--dry-run"])
+
+    assert exit_code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["dry_run"] is True
+    assert payload["method"] == "POST"
+    assert payload["path"].endswith("/projects")
+    assert payload["body"] == {"name": "Demo", "description": "d"}
+
+
+def test_edit_project_dry_run_previews_patch_body(config: core.RuntimeConfig) -> None:
+    result = commands.command_edit_project(
+        config,
+        project_id="p-uuid",
+        name=None,
+        description=None,
+        clear_description=False,
+        folder=None,
+        clear_folder=True,
+        dry_run=True,
+    )
+    assert result == {"dry_run": True, "method": "PATCH", "path": "/projects/p-uuid", "body": {"folder": None}}
+
+
+def test_edit_project_dry_run_still_validates_inputs(config: core.RuntimeConfig) -> None:
+    with pytest.raises(core.CliError, match="not both"):
+        commands.command_edit_project(
+            config,
+            project_id="p-uuid",
+            name=None,
+            description="x",
+            clear_description=True,
+            folder=None,
+            clear_folder=False,
+            dry_run=True,
+        )
+
+
+def test_sync_wildcard_without_test_or_yes_is_refused(config: core.RuntimeConfig) -> None:
+    args = cli.parse_args(["--env-file", "", "sync", "--session-id", "*"])
+    with pytest.raises(core.CliError) as excinfo:
+        commands.command_sync(config, args)
+    assert "--yes" in excinfo.value.message
+    assert "--test" in excinfo.value.message
+
+
+def test_sync_dry_run_is_an_alias_for_test() -> None:
+    args = cli.parse_args(["--env-file", "", "sync", "--session-id", "s1", "--dry-run"])
+    assert args.test is True
+
+
+def test_sync_wildcard_with_test_builds_payloads(
+    monkeypatch: pytest.MonkeyPatch,
+    config: core.RuntimeConfig,
+) -> None:
+    monkeypatch.setattr(commands.agentsview, "build_payloads", lambda db_path, *, session_id_query: [])
+    args = cli.parse_args(["--env-file", "", "sync", "--session-id", "*", "--test"])
+    assert commands.command_sync(config, args) == []
+
+
+def test_sync_wildcard_with_yes_proceeds_to_send(
+    monkeypatch: pytest.MonkeyPatch,
+    config: core.RuntimeConfig,
+) -> None:
+    monkeypatch.setenv("CLERK_API_KEY", "k")
+    monkeypatch.setenv("ORGANIZATION_ID", "o")
+    monkeypatch.setattr(commands.agentsview, "build_payloads", lambda db_path, *, session_id_query: [])
+    sent: dict[str, object] = {}
+
+    def fake_send_payloads(payloads: list, **kwargs: object) -> dict[str, object]:
+        sent["payloads"] = payloads
+        return {"sent_count": 0, "failed_count": 0, "sent": [], "failures": []}
+
+    monkeypatch.setattr(commands.agentsview, "send_payloads", fake_send_payloads)
+    args = cli.parse_args(["--env-file", "", "sync", "--session-id", "*", "--yes"])
+    result = commands.command_sync(config, args)
+    assert result["sent_count"] == 0
+    assert sent["payloads"] == []
+
+
+def test_main_api_verbs_accept_clerk_api_key_flag(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("CAPTION_API_URL", "http://localhost:8000")
+    monkeypatch.setenv("CLERK_API_KEY", "env-token")
+    seen: dict[str, object] = {}
+
+    def fake_command_list_projects(config: core.RuntimeConfig, *, full: bool = False) -> dict[str, object]:
+        seen["api_token"] = config.api_token
+        return {"workspaceId": "w", "items": [], "count": 0}
+
+    monkeypatch.setattr(cli, "command_list_projects", fake_command_list_projects)
+
+    exit_code = cli.run(
+        [
+            "--env-file",
+            "",
+            "--cache-path",
+            str(tmp_path / "search-token.json"),
+            "list_projects",
+            "--clerk-api-key",
+            "flag-token",
+        ]
+    )
+
+    assert exit_code == 0
+    assert seen["api_token"] == "flag-token"
+
+
+def test_main_api_verbs_all_parse_clerk_api_key() -> None:
+    assert cli.parse_args(["token", "--clerk-api-key", "k"]).clerk_api_key == "k"
+    assert cli.parse_args(["search", "q", "--clerk-api-key", "k"]).clerk_api_key == "k"
+    assert cli.parse_args(["list_folders", "--clerk-api-key", "k"]).clerk_api_key == "k"
+    assert cli.parse_args(["create_project", "N", "--clerk-api-key", "k"]).clerk_api_key == "k"
+    assert cli.parse_args(["edit_project", "id", "--name", "N", "--clerk-api-key", "k"]).clerk_api_key == "k"
+    assert cli.parse_args(["dl_transcript", "t", "--clerk-api-key", "k"]).clerk_api_key == "k"
+
+
+def test_bare_invocation_prints_cheat_sheet_help_and_exits_zero(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    with pytest.raises(SystemExit) as excinfo:
+        cli.parse_args([])
+
+    output = capsys.readouterr().out
+    assert excinfo.value.code == 0
+    assert "Command Cheat Sheet" in output
+    assert "Agent quick start" in output
+
+
+def test_run_robot_docs_guide_prints_agent_handbook_offline(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    for env_var in ("CAPTION_API_URL", "CLERK_API_KEY", "CAPTION_MEILI_URL", "ORGANIZATION_ID"):
+        monkeypatch.delenv(env_var, raising=False)
+
+    exit_code = cli.run(["--env-file", "", "robot-docs", "guide"])
+
+    output = capsys.readouterr().out
+    assert exit_code == 0
+    assert "# caption — agent guide" in output
+    assert "## Exit codes" in output
+    assert "## Environment" in output
+    assert "### search" in output
+    assert "caption capabilities" in output
+
+
+def test_robot_docs_topic_defaults_to_guide() -> None:
+    args = cli.parse_args(["robot-docs"])
+    assert args.topic == "guide"
+    assert args.output == "md"
+
+
+def test_subcommand_help_includes_notes_example_and_default_output(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    with pytest.raises(SystemExit):
+        cli.parse_args(["search", "-h"])
+
+    output = capsys.readouterr().out
+    assert "default output: table" in output
+    assert "Uses cached token and refreshes once on Meili auth failures." in output
+    assert 'example: caption search "roadmap" --index projects_v1 --limit 10' in output
+
+
+def test_top_level_help_has_agent_quick_start(capsys: pytest.CaptureFixture[str]) -> None:
+    with pytest.raises(SystemExit):
+        cli.parse_args(["-h"])
+
+    output = capsys.readouterr().out
+    assert "Agent quick start" in output
+    assert "caption capabilities" in output
+    assert "--output json" in output
 
 
 def test_legacy_subcommands_are_removed() -> None:
@@ -711,23 +1154,20 @@ def test_command_list_projects_fetches_workspace_and_all_projects(
     monkeypatch: pytest.MonkeyPatch,
     config: core.RuntimeConfig,
 ) -> None:
-    page_calls: list[tuple[str, str, int, int]] = []
+    fetch_calls: list[tuple[str, str]] = []
 
     def fake_fetch_current_workspace_id(api_url: str, api_token: str) -> str:
         assert api_url == "http://localhost:8000"
         assert api_token == "api-token"
         return "workspace-uuid"
 
-    def fake_fetch_workspace_items_page(
+    def fake_fetch_workspace_items(
         api_url: str,
         api_token: str,
         workspace_id: str,
         endpoint: str,
-        *,
-        page: int,
-        limit: int,
     ) -> list[dict[str, object]]:
-        page_calls.append((workspace_id, endpoint, page, limit))
+        fetch_calls.append((workspace_id, endpoint))
         assert endpoint == "projects"
         return [
             {
@@ -755,22 +1195,22 @@ def test_command_list_projects_fetches_workspace_and_all_projects(
         ]
 
     monkeypatch.setattr(commands, "fetch_current_workspace_id", fake_fetch_current_workspace_id)
-    monkeypatch.setattr(commands, "fetch_workspace_items_page", fake_fetch_workspace_items_page)
+    monkeypatch.setattr(commands, "fetch_workspace_items", fake_fetch_workspace_items)
 
     result = commands.command_list_projects(config)
 
     assert result["workspaceId"] == "workspace-uuid"
     assert result["count"] == 2
-    assert result["totalCount"] == 2
-    assert result["totalPages"] == 1
+    assert "totalCount" not in result
+    assert "totalPages" not in result
     assert [item["id"] for item in result["items"]] == ["p1", "p2"]
     for field in ("id", "createdAt", "updatedAt", "name", "description", "folder", "transcript"):
         assert field in result["items"][0]
     assert "workspace" not in result["items"][0]
     assert result["items"][0]["transcript"] == "t1"
     assert result["items"][1]["transcript"] == "t2"
-    assert page_calls == [
-        ("workspace-uuid", "projects", 0, core.WORKSPACE_LIST_PAGE_SIZE),
+    assert fetch_calls == [
+        ("workspace-uuid", "projects"),
     ]
 
 
@@ -778,23 +1218,20 @@ def test_command_list_folders_fetches_workspace_and_all_folders(
     monkeypatch: pytest.MonkeyPatch,
     config: core.RuntimeConfig,
 ) -> None:
-    page_calls: list[tuple[str, str, int, int]] = []
+    fetch_calls: list[tuple[str, str]] = []
 
     def fake_fetch_current_workspace_id(api_url: str, api_token: str) -> str:
         assert api_url == "http://localhost:8000"
         assert api_token == "api-token"
         return "workspace-uuid"
 
-    def fake_fetch_workspace_items_page(
+    def fake_fetch_workspace_items(
         api_url: str,
         api_token: str,
         workspace_id: str,
         endpoint: str,
-        *,
-        page: int,
-        limit: int,
     ) -> list[dict[str, object]]:
-        page_calls.append((workspace_id, endpoint, page, limit))
+        fetch_calls.append((workspace_id, endpoint))
         assert endpoint == "folders"
         return [
             {
@@ -820,22 +1257,22 @@ def test_command_list_folders_fetches_workspace_and_all_folders(
         ]
 
     monkeypatch.setattr(commands, "fetch_current_workspace_id", fake_fetch_current_workspace_id)
-    monkeypatch.setattr(commands, "fetch_workspace_items_page", fake_fetch_workspace_items_page)
+    monkeypatch.setattr(commands, "fetch_workspace_items", fake_fetch_workspace_items)
 
     result = commands.command_list_folders(config)
 
     assert result["workspaceId"] == "workspace-uuid"
     assert result["count"] == 2
-    assert result["totalCount"] == 2
-    assert result["totalPages"] == 1
+    assert "totalCount" not in result
+    assert "totalPages" not in result
     assert [item["id"] for item in result["items"]] == ["f1", "f2"]
     for field in ("id", "createdAt", "updatedAt", "name", "description", "parent"):
         assert field in result["items"][0]
     assert "workspace" not in result["items"][0]
     assert result["items"][0]["parent"] is None
     assert result["items"][1]["parent"] == "f1"
-    assert page_calls == [
-        ("workspace-uuid", "folders", 0, core.WORKSPACE_LIST_PAGE_SIZE),
+    assert fetch_calls == [
+        ("workspace-uuid", "folders"),
     ]
 
 
@@ -1205,7 +1642,7 @@ def test_emit_output_search_table_for_transcript_captions_uses_condensed_columns
     core.emit_output(payload, "table", command_name="search", search_index="transcript_captions_v1")
     out = capsys.readouterr().out
 
-    assert "TotalHits: 1 | returned: 1" in out
+    assert "hits: 1 | unique: 1" in out
     assert "| # | projectId (uuid) | speaker.name | updatedAt (YYYYMMDD) | content |" in out
     assert "project-uuid-1" in out
     assert "legacy-scope-project" not in out
@@ -1262,7 +1699,7 @@ def test_emit_output_search_table_for_projects_uses_condensed_columns(
     core.emit_output(payload, "table", command_name="search", search_index="projects_v1")
     out = capsys.readouterr().out
 
-    assert "TotalHits: 1 | returned: 1" in out
+    assert "hits: 1 | unique: 1" in out
     assert "| # | id (project uuid) | updatedAt (YYYYMMDD) | name | description |" in out
     assert "project-uuid-1" in out
     assert "20260209" in out
@@ -1386,13 +1823,11 @@ def test_run_list_projects_does_not_require_meili_url(monkeypatch: pytest.Monkey
     set_runtime_env(monkeypatch, meili_url=None)
     emitted = install_emit_output_capture(monkeypatch)
 
-    def fake_command_list_projects(config: core.RuntimeConfig) -> dict[str, object]:
+    def fake_command_list_projects(config: core.RuntimeConfig, *, full: bool = False) -> dict[str, object]:
         return {
             "workspaceId": "workspace-uuid",
             "items": [{"id": "p1", "name": "Alpha", "updatedAt": "2024-01-01T00:00:00Z", "folder": None}],
             "count": 1,
-            "totalCount": 1,
-            "totalPages": 1,
         }
 
     monkeypatch.setattr(cli, "command_list_projects", fake_command_list_projects)
@@ -1413,8 +1848,6 @@ def test_run_list_projects_does_not_require_meili_url(monkeypatch: pytest.Monkey
         "workspaceId": "workspace-uuid",
         "items": [{"id": "p1", "name": "Alpha", "updatedAt": "2024-01-01T00:00:00Z", "folder": None}],
         "count": 1,
-        "totalCount": 1,
-        "totalPages": 1,
     }
 
 
@@ -1426,13 +1859,11 @@ def test_run_list_projects_writes_rendered_output_file_and_saved_line(
     set_runtime_env(monkeypatch, meili_url=None)
     output_file = tmp_path / "nested" / "projects.tsv"
 
-    def fake_command_list_projects(config: core.RuntimeConfig) -> dict[str, object]:
+    def fake_command_list_projects(config: core.RuntimeConfig, *, full: bool = False) -> dict[str, object]:
         return {
             "workspaceId": "workspace-uuid",
             "items": [{"id": "p1", "name": "Alpha", "updatedAt": "2024-01-01T00:00:00Z", "folder": None}],
             "count": 1,
-            "totalCount": 1,
-            "totalPages": 1,
         }
 
     monkeypatch.setattr(cli, "command_list_projects", fake_command_list_projects)
@@ -1450,7 +1881,9 @@ def test_run_list_projects_writes_rendered_output_file_and_saved_line(
     )
 
     assert exit_code == 0
-    assert capsys.readouterr().out == f"Saved list_projects output to {output_file}\n"
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == f"Saved list_projects output to {output_file}\n"
     assert output_file.read_text(encoding="utf-8") == (
         "workspaceId: workspace-uuid\n"
         "count: 1\n"
@@ -1510,13 +1943,11 @@ def test_run_list_folders_does_not_require_meili_url(monkeypatch: pytest.MonkeyP
     set_runtime_env(monkeypatch, meili_url=None)
     emitted = install_emit_output_capture(monkeypatch)
 
-    def fake_command_list_folders(config: core.RuntimeConfig) -> dict[str, object]:
+    def fake_command_list_folders(config: core.RuntimeConfig, *, full: bool = False) -> dict[str, object]:
         return {
             "workspaceId": "workspace-uuid",
             "items": [{"id": "f1", "name": "Root", "updatedAt": "2024-01-01T00:00:00Z", "parent": None}],
             "count": 1,
-            "totalCount": 1,
-            "totalPages": 1,
         }
 
     monkeypatch.setattr(cli, "command_list_folders", fake_command_list_folders)
@@ -1537,8 +1968,6 @@ def test_run_list_folders_does_not_require_meili_url(monkeypatch: pytest.MonkeyP
         "workspaceId": "workspace-uuid",
         "items": [{"id": "f1", "name": "Root", "updatedAt": "2024-01-01T00:00:00Z", "parent": None}],
         "count": 1,
-        "totalCount": 1,
-        "totalPages": 1,
     }
 
 
@@ -1600,7 +2029,9 @@ def test_run_dl_transcript_writes_default_md_output_file(
     )
 
     assert exit_code == 0
-    assert capsys.readouterr().out == f"Saved dl_transcript output to {output_file}\n"
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == f"Saved dl_transcript output to {output_file}\n"
     assert output_file.read_text(encoding="utf-8") == f"{transcript_text}\n"
 
 
@@ -1697,7 +2128,9 @@ def test_run_dl_transcript_with_json_output_writes_json_rendered_output_file(
     )
 
     assert exit_code == 0
-    assert capsys.readouterr().out == f"Saved dl_transcript output to {output_file}\n"
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == f"Saved dl_transcript output to {output_file}\n"
     assert output_file.read_text(encoding="utf-8") == f"{json.dumps(payload, indent=2)}\n"
 
 
@@ -1742,6 +2175,7 @@ def test_run_create_project_does_not_require_meili_url(monkeypatch: pytest.Monke
         name: str,
         description: str | None,
         workspace_id: str | None,
+        dry_run: bool = False,
     ) -> dict[str, object]:
         assert name == "My Project"
         assert description == "Desc"
@@ -1795,6 +2229,7 @@ def test_run_create_folder_does_not_require_meili_url(monkeypatch: pytest.Monkey
         description: str | None,
         parent: str | None,
         workspace_id: str | None,
+        dry_run: bool = False,
     ) -> dict[str, object]:
         assert name == "My Folder"
         assert description == "Desc"

@@ -26,6 +26,18 @@ uv run caption.py --help
 
 `caption.py` is a thin wrapper that calls [`caption_cli.main:main`](/Users/alin/code/caption/caption-cli/caption_cli/main.py). The actual command registration lives in [`caption_cli/cli.py`](/Users/alin/code/caption/caption-cli/caption_cli/cli.py), and the API/Meilisearch behavior lives in [`caption_cli/commands.py`](/Users/alin/code/caption/caption-cli/caption_cli/commands.py) and [`caption_cli/core.py`](/Users/alin/code/caption/caption-cli/caption_cli/core.py).
 
+### Discovery (start here if you are an agent)
+
+- `capabilities`: machine-readable CLI contract — commands, exit codes, env vars (JSON, offline)
+- `robot-docs guide`: paste-ready agent handbook (Markdown, offline)
+- `doctor [--strict]`: probe which Caption features are reachable; failed probes print reasons to stderr, `--strict` exits non-zero
+
+```bash
+uv run caption capabilities
+uv run caption robot-docs guide
+uv run caption --output json doctor --strict
+```
+
 ### Environment
 
 These variables are used by the main Caption commands:

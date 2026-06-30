@@ -161,6 +161,85 @@ def test_create_md_uses_expected_request_contract(monkeypatch: pytest.MonkeyPatc
     }
 
 
+def _long_document_transport() -> httpx.MockTransport:
+    return httpx.MockTransport(
+        lambda request: httpx.Response(
+            status_code=201,
+            headers={"content-type": "application/json"},
+            json={"id": "doc-id", "raw_markdown": "m" * 101, "plain_text": "p" * 101},
+        )
+    )
+
+
+def test_create_md_json_output_never_truncates(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    markdown_file = tmp_path / "README.md"
+    markdown_file.write_text("# Hello\n", encoding="utf-8")
+    monkeypatch.setenv("CLERK_API_KEY", "env-token")
+    monkeypatch.setenv("ORGANIZATION_ID", "env-org")
+
+    json_config = core.RuntimeConfig(
+        api_url=None, api_token=None, meili_url=None, cache_path=Path("unused"), output="json"
+    )
+    args = cli.parse_args(["--env-file", "", "create_md", str(markdown_file)])
+    result = agentsview.command_create_md(json_config, args, transport=_long_document_transport())
+
+    assert result["raw_markdown"] == "m" * 101
+    assert result["plain_text"] == "p" * 101
+
+
+def test_create_md_full_flag_never_truncates(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    markdown_file = tmp_path / "README.md"
+    markdown_file.write_text("# Hello\n", encoding="utf-8")
+    monkeypatch.setenv("CLERK_API_KEY", "env-token")
+    monkeypatch.setenv("ORGANIZATION_ID", "env-org")
+
+    args = cli.parse_args(["--env-file", "", "create_md", str(markdown_file), "--full"])
+    result = agentsview.command_create_md(None, args, transport=_long_document_transport())
+
+    assert result["raw_markdown"] == "m" * 101
+    assert result["plain_text"] == "p" * 101
+
+
+def test_create_md_truncated_view_warns_on_stderr(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    markdown_file = tmp_path / "README.md"
+    markdown_file.write_text("# Hello\n", encoding="utf-8")
+    monkeypatch.setenv("CLERK_API_KEY", "env-token")
+    monkeypatch.setenv("ORGANIZATION_ID", "env-org")
+
+    args = cli.parse_args(["--env-file", "", "create_md", str(markdown_file)])
+    result = agentsview.command_create_md(None, args, transport=_long_document_transport())
+
+    assert result["raw_markdown"] == "m" * 100
+    assert "condensed view" in capsys.readouterr().err
+
+
+def test_list_md_full_returns_raw_documents(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("CLERK_API_KEY", "env-token")
+    monkeypatch.setenv("ORGANIZATION_ID", "env-org")
+
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(
+            status_code=200,
+            headers={"content-type": "application/json"},
+            json={
+                "documents": [
+                    {"id": "doc-id", "title": "T", "star_count": 3, "created_by": "user_1"}
+                ],
+                "total": 1,
+            },
+        )
+    )
+    args = cli.parse_args(["--env-file", "", "list_md", "--full"])
+    result = agentsview.command_list_md(None, args, transport=transport)
+
+    assert result["documents"][0]["star_count"] == 3
+    assert result["documents"][0]["created_by"] == "user_1"
+
+
 def test_create_md_honors_explicit_title(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     markdown_file = tmp_path / "README.md"
     markdown_file.write_text("# Hello\n", encoding="utf-8")
@@ -351,7 +430,9 @@ def test_run_get_md_writes_default_cache_file(
 
     output_file = tmp_path / "caption_cache" / "md" / "Title_Already.md"
     assert exit_code == 0
-    assert capsys.readouterr().out == "Saved get_md output to caption_cache/md/Title_Already.md\n"
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == "Saved get_md output to caption_cache/md/Title_Already.md\n"
     assert output_file.read_text(encoding="utf-8") == "# Hello\n"
 
 
@@ -376,7 +457,9 @@ def test_run_get_md_strips_repeated_markdown_suffixes_from_default_filename(
 
     output_file = tmp_path / "caption_cache" / "md" / "Case_Notes.md"
     assert exit_code == 0
-    assert capsys.readouterr().out == "Saved get_md output to caption_cache/md/Case_Notes.md\n"
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == "Saved get_md output to caption_cache/md/Case_Notes.md\n"
     assert output_file.read_text(encoding="utf-8") == "# Hello\n"
 
 
@@ -396,7 +479,9 @@ def test_run_get_md_honors_output_file(
     exit_code = cli.run(["--env-file", "", "--output-file", str(output_file), "get_md", "doc-id"])
 
     assert exit_code == 0
-    assert capsys.readouterr().out == f"Saved get_md output to {output_file}\n"
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == f"Saved get_md output to {output_file}\n"
     assert output_file.read_text(encoding="utf-8") == "# Hello\n"
 
 

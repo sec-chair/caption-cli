@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import re
 import uuid
 from typing import Any, Callable, Mapping
@@ -11,7 +12,6 @@ from caption_cli import agentsview
 from caption_cli.core import (
     CliError,
     RuntimeConfig,
-    WORKSPACE_LIST_PAGE_SIZE,
     _authorized_get_text,
     _authorized_request,
     _folder_view,
@@ -22,9 +22,10 @@ from caption_cli.core import (
     _run_with_single_auth_retry,
     fetch_current_workspace_id,
     fetch_search_token,
-    fetch_workspace_items_page,
+    fetch_workspace_items,
     resolve_meili_url,
     save_search_token,
+    warn_condensed_output,
 )
 
 def command_token(config: RuntimeConfig, *, show_token: bool = False) -> dict[str, Any]:
@@ -108,53 +109,56 @@ def _command_list_workspace_items(
     *,
     endpoint: str,
     item_view: Callable[[Mapping[str, Any]], dict[str, Any]],
+    full: bool = False,
 ) -> dict[str, Any]:
     api_url = _require_api_url(config)
     api_token = _require_api_token(config)
     workspace_id = fetch_current_workspace_id(api_url, api_token)
 
-    raw_items = fetch_workspace_items_page(
+    raw_items = fetch_workspace_items(
         api_url,
         api_token,
         workspace_id,
         endpoint,
-        page=0,
-        limit=WORKSPACE_LIST_PAGE_SIZE,
     )
     path = f"/folders/{{folderId}}/{endpoint}"
     items_out: list[dict[str, Any]] = []
     for item in raw_items:
         if not isinstance(item, dict):
             raise CliError(f"{path} response contains non-object item")
-        items_out.append(item_view(item))
+        items_out.append(dict(item) if full else item_view(item))
+    if not full:
+        warn_condensed_output(f"list_{endpoint}")
 
     return {
         "workspaceId": workspace_id,
         "items": items_out,
         "count": len(items_out),
-        "totalCount": len(items_out),
-        "totalPages": 1,
     }
 
 
-def command_list_projects(config: RuntimeConfig) -> dict[str, Any]:
-    return _command_list_workspace_items(config, endpoint="projects", item_view=_project_view)
+def command_list_projects(config: RuntimeConfig, *, full: bool = False) -> dict[str, Any]:
+    return _command_list_workspace_items(config, endpoint="projects", item_view=_project_view, full=full)
 
 
-def command_list_folders(config: RuntimeConfig) -> dict[str, Any]:
-    return _command_list_workspace_items(config, endpoint="folders", item_view=_folder_view)
+def command_list_folders(config: RuntimeConfig, *, full: bool = False) -> dict[str, Any]:
+    return _command_list_workspace_items(config, endpoint="folders", item_view=_folder_view, full=full)
 
 
-def _doctor_caption_available(config: RuntimeConfig) -> bool:
+def _doctor_caption_available(config: RuntimeConfig) -> tuple[bool, str | None]:
     try:
         workspace_id = fetch_current_workspace_id(_require_api_url(config), _require_api_token(config))
         uuid.UUID(workspace_id)
-    except (CliError, ValueError, httpx.HTTPError):
-        return False
-    return True
+    except CliError as exc:
+        return False, exc.message
+    except ValueError:
+        return False, "/users/me/workspace returned a non-UUID workspace id"
+    except httpx.HTTPError as exc:
+        return False, f"Caption API unreachable: {exc}"
+    return True, None
 
 
-def _doctor_agentsview_available(args: Any) -> bool:
+def _doctor_agentsview_available(args: Any) -> tuple[bool, str | None]:
     try:
         payload = agentsview._agentsview_json(
             "GET",
@@ -163,23 +167,46 @@ def _doctor_agentsview_available(args: Any) -> bool:
             params={"limit": 1},
             expected_statuses={200},
         )
-    except (CliError, httpx.HTTPError):
-        return False
-    return "documents" in payload
+    except CliError as exc:
+        return False, exc.message
+    except httpx.HTTPError as exc:
+        return False, f"history server unreachable: {exc}"
+    if "documents" not in payload:
+        return False, "GET /api/v1/md response missing 'documents'"
+    return True, None
 
 
-def command_doctor(config: RuntimeConfig, args: Any) -> list[str]:
-    features: list[str] = []
-    if _doctor_caption_available(config):
-        features.append("core")
-    if _doctor_agentsview_available(args):
-        features.append("agentsview")
-    return features
+def command_doctor(config: RuntimeConfig, args: Any) -> dict[str, Any]:
+    core_available, core_reason = _doctor_caption_available(config)
+    agentsview_available, agentsview_reason = _doctor_agentsview_available(args)
+    probes = [
+        {"name": "core", "available": core_available, "reason": core_reason},
+        {"name": "agentsview", "available": agentsview_available, "reason": agentsview_reason},
+    ]
+    organization = getattr(args, "org_id", None) or os.getenv("ORGANIZATION_ID")
+    return {
+        "organization": organization,
+        "features": [probe["name"] for probe in probes if probe["available"]],
+        "probes": probes,
+    }
 
 
 def _resolve_workspace_id(api_url: str, api_token: str, workspace_id: str | None) -> str:
     if workspace_id is None:
         return fetch_current_workspace_id(api_url, api_token)
+    resolved_workspace_id = workspace_id.strip()
+    if not resolved_workspace_id:
+        raise CliError("--workspace-id cannot be empty")
+    return resolved_workspace_id
+
+
+def _dry_run_result(method: str, path: str, body: Mapping[str, Any]) -> dict[str, Any]:
+    return {"dry_run": True, "method": method, "path": path, "body": dict(body)}
+
+
+def _dry_run_workspace_segment(workspace_id: str | None) -> str:
+    if workspace_id is None:
+        return "{workspaceId from /users/me/workspace}"
     resolved_workspace_id = workspace_id.strip()
     if not resolved_workspace_id:
         raise CliError("--workspace-id cannot be empty")
@@ -274,11 +301,15 @@ def command_create_project(
     name: str,
     description: str | None,
     workspace_id: str | None,
+    dry_run: bool = False,
 ) -> dict[str, Any]:
+    body = _build_create_body(command_name="create_project", name=name, description=description)
+    if dry_run:
+        return _dry_run_result("POST", f"/folders/{_dry_run_workspace_segment(workspace_id)}/projects", body)
+
     api_url = _require_api_url(config)
     api_token = _require_api_token(config)
     resolved_workspace_id = _resolve_workspace_id(api_url, api_token, workspace_id)
-    body = _build_create_body(command_name="create_project", name=name, description=description)
 
     payload = _authorized_request(
         api_url,
@@ -298,10 +329,8 @@ def command_create_folder(
     description: str | None,
     parent: str | None,
     workspace_id: str | None,
+    dry_run: bool = False,
 ) -> dict[str, Any]:
-    api_url = _require_api_url(config)
-    api_token = _require_api_token(config)
-    resolved_workspace_id = _resolve_workspace_id(api_url, api_token, workspace_id)
     body = _build_create_body(
         command_name="create_folder",
         name=name,
@@ -310,6 +339,12 @@ def command_create_folder(
         nullable_link_field="parent",
         nullable_link_arg="--parent",
     )
+    if dry_run:
+        return _dry_run_result("POST", f"/folders/{_dry_run_workspace_segment(workspace_id)}/folders", body)
+
+    api_url = _require_api_url(config)
+    api_token = _require_api_token(config)
+    resolved_workspace_id = _resolve_workspace_id(api_url, api_token, workspace_id)
 
     payload = _authorized_request(
         api_url,
@@ -331,9 +366,8 @@ def command_edit_project(
     clear_description: bool,
     folder: str | None,
     clear_folder: bool,
+    dry_run: bool = False,
 ) -> dict[str, Any]:
-    api_url = _require_api_url(config)
-    api_token = _require_api_token(config)
     cleaned_project_id = _clean_required_id(project_id, "project_id")
     body = _build_edit_body(
         command_name="edit_project",
@@ -346,6 +380,11 @@ def command_edit_project(
         nullable_link_arg="--folder",
         clear_nullable_link_arg="--clear-folder",
     )
+    if dry_run:
+        return _dry_run_result("PATCH", f"/projects/{cleaned_project_id}", body)
+
+    api_url = _require_api_url(config)
+    api_token = _require_api_token(config)
 
     payload = _authorized_request(
         api_url,
@@ -367,9 +406,8 @@ def command_edit_folder(
     clear_description: bool,
     parent: str | None,
     clear_parent: bool,
+    dry_run: bool = False,
 ) -> dict[str, Any]:
-    api_url = _require_api_url(config)
-    api_token = _require_api_token(config)
     cleaned_folder_id = _clean_required_id(folder_id, "folder_id")
     body = _build_edit_body(
         command_name="edit_folder",
@@ -382,6 +420,11 @@ def command_edit_folder(
         nullable_link_arg="--parent",
         clear_nullable_link_arg="--clear-parent",
     )
+    if dry_run:
+        return _dry_run_result("PATCH", f"/folders/{cleaned_folder_id}", body)
+
+    api_url = _require_api_url(config)
+    api_token = _require_api_token(config)
 
     payload = _authorized_request(
         api_url,

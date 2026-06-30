@@ -6,7 +6,7 @@ import httpx
 from meilisearch.errors import MeilisearchApiError
 
 from caption_cli import cli
-from caption_cli.core import CliError, _stringify_error
+from caption_cli.core import EXIT_UPSTREAM, CliError, _stringify_error
 
 
 def main() -> None:
@@ -17,6 +17,6 @@ def main() -> None:
         raise SystemExit(exc.exit_code) from exc
     except (httpx.HTTPError, MeilisearchApiError) as exc:
         print(_stringify_error(exc), file=sys.stderr)
-        raise SystemExit(1) from exc
+        raise SystemExit(EXIT_UPSTREAM) from exc
 
     raise SystemExit(exit_code)

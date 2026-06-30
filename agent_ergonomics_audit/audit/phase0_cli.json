@@ -1,0 +1,18 @@
+{
+  "target_path": "/Users/alin/code/caption/caption-cli",
+  "discovered_at": "2026-07-02T20:57:04Z",
+  "languages": [
+    "python"
+  ],
+  "binaries": [
+    "caption",
+    "dev"
+  ],
+  "env_var_prefix": "CAPTION",
+  "existing_surfaces": {
+    "robot_mode": false,
+    "capabilities": false,
+    "robot_docs": false
+  },
+  "recommended_mode": "full"
+}

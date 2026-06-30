@@ -9,7 +9,13 @@ from typing import Any, Iterable, Mapping
 
 import httpx
 
-from caption_cli.core import CliError
+from caption_cli.core import (
+    CliError,
+    EXIT_CONFIG,
+    EXIT_UPSTREAM,
+    _exit_code_for_status,
+    warn_condensed_output,
+)
 
 AGENTSVIEW_BASE_URL = "https://history.caption.fyi"
 AGENTSVIEW_USER_AGENT = "caption-cli"
@@ -73,9 +79,9 @@ def _clean_optional(value: str | None, label: str) -> str | None:
     return cleaned
 
 
-def _require_value(value: str | None, label: str) -> str:
+def _require_value(value: str | None, label: str, *, exit_code: int = 1) -> str:
     if value is None or not value.strip():
-        raise CliError(f"Missing {label}")
+        raise CliError(f"Missing {label}", exit_code=exit_code)
     return value.strip()
 
 
@@ -84,10 +90,12 @@ def _agentsview_auth(args: argparse.Namespace) -> tuple[str, str]:
         _require_value(
             _clean_optional(args.clerk_api_key, "--clerk-api-key") or os.getenv("CLERK_API_KEY"),
             "Clerk API key (--clerk-api-key or CLERK_API_KEY)",
+            exit_code=EXIT_CONFIG,
         ),
         _require_value(
             _clean_optional(args.org_id, "--org-id") or os.getenv("ORGANIZATION_ID"),
             "org id (--org-id or ORGANIZATION_ID)",
+            exit_code=EXIT_CONFIG,
         ),
     )
 
@@ -117,7 +125,10 @@ def _agentsview_request(
 
     if response.status_code not in expected_statuses:
         detail = response.text.strip() or response.reason_phrase
-        raise CliError(f"Failed {method.upper()} {path} ({response.status_code}): {detail}")
+        raise CliError(
+            f"Failed {method.upper()} {path} ({response.status_code}): {detail}",
+            exit_code=_exit_code_for_status(response.status_code),
+        )
     if expected_statuses == {204}:
         return None
 
@@ -128,14 +139,15 @@ def _agentsview_request(
             excerpt = f"{excerpt[:237]}..."
         raise CliError(
             f"{method.upper()} {path} returned non-JSON response "
-            f"({response.status_code}, {content_type or 'no content-type'}): {excerpt}"
+            f"({response.status_code}, {content_type or 'no content-type'}): {excerpt}",
+            exit_code=EXIT_UPSTREAM,
         )
     try:
         payload = response.json()
     except ValueError as exc:
-        raise CliError(f"{method.upper()} {path} returned invalid JSON: {exc}") from exc
+        raise CliError(f"{method.upper()} {path} returned invalid JSON: {exc}", exit_code=EXIT_UPSTREAM) from exc
     if not isinstance(payload, dict):
-        raise CliError(f"{method.upper()} {path} returned non-object JSON")
+        raise CliError(f"{method.upper()} {path} returned non-object JSON", exit_code=EXIT_UPSTREAM)
     return payload
 
 
@@ -405,7 +417,7 @@ def _validate_raw_markdown(payload: Mapping[str, Any], doc_id: str) -> None:
         raise CliError(f"/api/v1/md/{doc_id} response missing string 'raw_markdown'")
 
 
-def command_create_md(_: Any, args: argparse.Namespace, *, transport: httpx.BaseTransport | None = None) -> Mapping[str, Any]:
+def command_create_md(config: Any, args: argparse.Namespace, *, transport: httpx.BaseTransport | None = None) -> Mapping[str, Any]:
     body: dict[str, Any] = {"raw_markdown": _read_markdown_file(args.markdown_file)}
     for body_key, attr_name, label in (
         ("project_id", "project_id", "--project-id"),
@@ -415,6 +427,8 @@ def command_create_md(_: Any, args: argparse.Namespace, *, transport: httpx.Base
         if value is not None:
             body[body_key] = value
     body["title"] = _clean_optional(args.title, "--title") or _markdown_filename(args.markdown_file)
+    if getattr(args, "dry_run", False):
+        return {"dry_run": True, "method": "POST", "path": "/api/v1/projects/md", "body": body}
     payload = _agentsview_json(
         "POST",
         "/api/v1/projects/md",
@@ -423,6 +437,9 @@ def command_create_md(_: Any, args: argparse.Namespace, *, transport: httpx.Base
         expected_statuses={201},
         transport=transport,
     )
+    if getattr(args, "full", False) or getattr(config, "output", None) == "json":
+        return payload
+    warn_condensed_output("create_md", hint="--full (or --output json)")
     return _truncate_create_md_output(payload)
 
 
@@ -456,6 +473,9 @@ def command_list_md(_: Any, args: argparse.Namespace, *, transport: httpx.BaseTr
         expected_statuses={200},
         transport=transport,
     )
+    if getattr(args, "full", False):
+        return payload
+    warn_condensed_output("list_md")
     return _condense_list(payload, ("documents", "items"), _condense_md)
 
 
@@ -468,6 +488,9 @@ def command_list_matters(_: Any, args: argparse.Namespace, *, transport: httpx.B
         expected_statuses={200},
         transport=transport,
     )
+    if getattr(args, "full", False):
+        return payload
+    warn_condensed_output("list_matters")
     return _condense_list(
         payload,
         ("projects",),
@@ -563,6 +586,12 @@ def _escape_like(value: str) -> str:
 
 
 def command_sync(_: Any, args: argparse.Namespace) -> object:
+    session_id_query = args.session_id.strip() if isinstance(args.session_id, str) else args.session_id
+    if session_id_query == "*" and not args.test and not getattr(args, "yes", False):
+        raise CliError(
+            "sync --session-id '*' sends ALL sessions to the hosted history server. "
+            "Add --yes to confirm, or use --test to preview the payloads without sending."
+        )
     payloads = build_payloads(Path(args.db_path).expanduser(), session_id_query=args.session_id)
     override_payload_project_name(payloads, args.project_name)
     if args.test:

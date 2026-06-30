@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
@@ -9,10 +10,19 @@ from typing import Any, Callable, Mapping, Sequence
 import httpx
 import meilisearch
 
+# Exit-code dictionary (published via `caption capabilities` and --help):
+#   0 success · 1 user-input error · 2 usage error (argparse)
+#   3 configuration error (missing env) · 4 upstream failure · 5 remote not found
+EXIT_SUCCESS = 0
+EXIT_USER_INPUT = 1
+EXIT_USAGE = 2
+EXIT_CONFIG = 3
+EXIT_UPSTREAM = 4
+EXIT_NOT_FOUND = 5
+
 DEFAULT_CACHE_PATH = "search-token.json"
 DEFAULT_LIMIT = 1000
 DEFAULT_SEARCH_INDEX = "transcript_captions_v1"
-WORKSPACE_LIST_PAGE_SIZE = 100
 PROJECT_OUTPUT_FIELDS = (
     "id",
     "transcript",
@@ -94,6 +104,10 @@ class CommandSpec:
     example: str = ""
 
 
+def _exit_code_for_status(status_code: int) -> int:
+    return EXIT_NOT_FOUND if status_code == 404 else EXIT_UPSTREAM
+
+
 def fetch_search_token(api_url: str, api_token: str) -> SearchToken:
     url = f"{api_url.rstrip('/')}/search/token"
     headers = {"Authorization": f"Bearer {api_token}"}
@@ -103,12 +117,13 @@ def fetch_search_token(api_url: str, api_token: str) -> SearchToken:
     if response.status_code >= 400:
         detail = response.text.strip() or response.reason_phrase
         raise CliError(
-            f"Failed to fetch search token ({response.status_code}): {detail}"
+            f"Failed to fetch search token ({response.status_code}): {detail}",
+            exit_code=_exit_code_for_status(response.status_code),
         )
 
     payload = response.json()
     if not isinstance(payload, dict):
-        raise CliError("/search/token returned non-object JSON")
+        raise CliError("/search/token returned non-object JSON", exit_code=EXIT_UPSTREAM)
     return SearchToken.from_payload(payload)
 
 
@@ -135,12 +150,13 @@ def _authorized_request(
     if is_error:
         detail = response.text.strip() or response.reason_phrase
         raise CliError(
-            f"Failed {method.upper()} {path} ({response.status_code}): {detail}"
+            f"Failed {method.upper()} {path} ({response.status_code}): {detail}",
+            exit_code=_exit_code_for_status(response.status_code),
         )
 
     payload = response.json()
     if not isinstance(payload, dict):
-        raise CliError(f"{path} returned non-object JSON")
+        raise CliError(f"{path} returned non-object JSON", exit_code=EXIT_UPSTREAM)
     return payload
 
 
@@ -166,7 +182,10 @@ def _authorized_get_text(
 
     if response.status_code != 200:
         detail = response.text.strip() or response.reason_phrase
-        raise CliError(f"Failed GET {path} ({response.status_code}): {detail}")
+        raise CliError(
+            f"Failed GET {path} ({response.status_code}): {detail}",
+            exit_code=_exit_code_for_status(response.status_code),
+        )
 
     return response.text
 
@@ -183,7 +202,10 @@ def _authorized_get_list_of_objects(
 
     if response.status_code != 200:
         detail = response.text.strip() or response.reason_phrase
-        raise CliError(f"Failed GET {path} ({response.status_code}): {detail}")
+        raise CliError(
+            f"Failed GET {path} ({response.status_code}): {detail}",
+            exit_code=_exit_code_for_status(response.status_code),
+        )
 
     return _extract_object_list(response.json(), path)
 
@@ -195,15 +217,22 @@ def _extract_object_list(payload: Any, path: str) -> list[Mapping[str, Any]]:
     elif isinstance(payload, Mapping):
         raw_items = payload.get("items")
         if not isinstance(raw_items, list):
-            raise CliError(f"{path} returned JSON object missing array 'items'")
+            raise CliError(f"{path} returned JSON object missing array 'items'", exit_code=EXIT_UPSTREAM)
         items = raw_items
         item_location = "'items' array"
     else:
-        raise CliError(f"{path} returned non-array JSON")
+        raise CliError(f"{path} returned non-array JSON", exit_code=EXIT_UPSTREAM)
 
     if not all(isinstance(item, dict) for item in items):
-        raise CliError(f"{path} returned {item_location} containing non-object items")
+        raise CliError(f"{path} returned {item_location} containing non-object items", exit_code=EXIT_UPSTREAM)
     return items
+
+
+def warn_condensed_output(command_name: str, hint: str = "--full") -> None:
+    print(
+        f"note: {command_name} output is a condensed view; pass {hint} for the raw server payload",
+        file=sys.stderr,
+    )
 
 
 def _field_view(payload: Mapping[str, Any], fields: Sequence[str]) -> dict[str, Any]:
@@ -226,14 +255,11 @@ def fetch_current_workspace_id(api_url: str, api_token: str) -> str:
     return workspace_id
 
 
-def fetch_workspace_items_page(
+def fetch_workspace_items(
     api_url: str,
     api_token: str,
     workspace_id: str,
     endpoint: str,
-    *,
-    page: int,
-    limit: int = WORKSPACE_LIST_PAGE_SIZE,
 ) -> list[Mapping[str, Any]]:
     return _authorized_get_list_of_objects(
         api_url,
@@ -267,13 +293,13 @@ def save_search_token(cache_path: Path, search_token: SearchToken) -> None:
 def _require_api_url(config: RuntimeConfig) -> str:
     if config.api_url and config.api_url.strip():
         return config.api_url.strip()
-    raise CliError("Missing Caption API URL. Set CAPTION_API_URL")
+    raise CliError("Missing Caption API URL. Set CAPTION_API_URL", exit_code=EXIT_CONFIG)
 
 
 def _require_meili_url(config: RuntimeConfig) -> str:
     if config.meili_url and config.meili_url.strip():
         return config.meili_url.strip()
-    raise CliError("Missing Meilisearch URL. Set CAPTION_MEILI_URL")
+    raise CliError("Missing Meilisearch URL. Set CAPTION_MEILI_URL", exit_code=EXIT_CONFIG)
 
 
 def resolve_meili_url(config: RuntimeConfig) -> str:
@@ -313,7 +339,7 @@ def _is_meili_auth_error(err: Exception) -> bool:
 def _require_api_token(config: RuntimeConfig) -> str:
     if config.api_token and config.api_token.strip():
         return config.api_token.strip()
-    raise CliError("Missing API bearer token. Set CLERK_API_KEY")
+    raise CliError("Missing Clerk API key. Pass --clerk-api-key or set CLERK_API_KEY", exit_code=EXIT_CONFIG)
 
 
 def _require_cached_or_fresh_token(config: RuntimeConfig) -> SearchToken:
@@ -339,7 +365,7 @@ def _run_with_single_auth_retry(
         return operation(client)
     except Exception as exc:
         if not _is_meili_auth_error(exc):
-            raise CliError(_stringify_error(exc)) from exc
+            raise CliError(_stringify_error(exc), exit_code=EXIT_UPSTREAM) from exc
 
         api_token = _require_api_token(config)
         refreshed_token = fetch_search_token(_require_api_url(config), api_token)
@@ -351,7 +377,7 @@ def _run_with_single_auth_retry(
         try:
             return operation(retry_client)
         except Exception as retry_exc:
-            raise CliError(_stringify_error(retry_exc)) from retry_exc
+            raise CliError(_stringify_error(retry_exc), exit_code=EXIT_UPSTREAM) from retry_exc
 
 
 def _render_table(value: Any, *, command_name: str | None = None) -> str:
