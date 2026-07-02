@@ -106,6 +106,32 @@ uv run caption --output-file transcripts/transcript-uuid.md dl_transcript transc
 uv run caption --output json --output-file transcripts/transcript-uuid.json dl_transcript transcript-uuid
 ```
 
+#### Speakers
+
+- `assign_speakers`: assign a speaker to transcript captions by channel and optional diarization index
+- `list_speakers <transcript_id>`: summarize `(channel, index, speakerId)` caption groups for a transcript
+- `rename_speaker <project_id> <speaker_id>`: rename a custom speaker across a project
+
+A typical flow: inspect a transcript with `list_speakers` to see which `(channel, index)` groups exist, then label each group with `assign_speakers`, and fix mistakes later with `rename_speaker`.
+
+```bash
+uv run caption list_speakers transcript-uuid
+uv run caption assign_speakers --transcript-id transcript-uuid --channel microphone --index 1 --name "Alice"
+uv run caption assign_speakers --project-id project-uuid --channel loopback --name "Opposing Counsel"
+uv run caption rename_speaker project-uuid speaker-uuid --name "Alice Smith"
+```
+
+`assign_speakers` targets exactly one of `--transcript-id` or `--project-id`, and identifies the speaker with exactly one of `--name` or `--speaker-id`:
+
+- `--channel` accepts `0|microphone`, `1|loopback`, or `2|external`
+- `--index` filters to one diarization index; omit it to update every index in the channel
+- `--name` reuses or creates a custom speaker scoped to the transcript's project (preferred)
+- `--speaker-id` assigns an existing speaker UUID; the API does not verify it belongs to the transcript's project, so only pass IDs obtained from the same project
+- `--project-id` fans out over every transcript in the project and aggregates per-transcript results; diarization indexes are not stable across transcripts, so project-wide assignment usually makes sense without `--index`
+- `--dry-run` prints the request that would be sent without sending it (also supported by `rename_speaker`)
+
+`list_speakers` shows speaker IDs only — caption payloads do not include speaker names. `rename_speaker` only works on custom speakers; user-backed speakers are rejected by the API.
+
 #### Hosted Markdown documents
 
 These commands use `https://history.caption.fyi`, like `sync`, and do not require `CAPTION_API_URL` or `CAPTION_MEILI_URL`.

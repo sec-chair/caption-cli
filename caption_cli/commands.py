@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import re
+import sys
 import uuid
 from typing import Any, Callable, Mapping
 
@@ -12,6 +13,7 @@ from caption_cli import agentsview
 from caption_cli.core import (
     CliError,
     RuntimeConfig,
+    _authorized_get_list_of_objects,
     _authorized_get_text,
     _authorized_request,
     _folder_view,
@@ -20,6 +22,7 @@ from caption_cli.core import (
     _require_api_url,
     _require_cached_or_fresh_token,
     _run_with_single_auth_retry,
+    _truncate_for_cell,
     fetch_current_workspace_id,
     fetch_search_token,
     fetch_workspace_items,
@@ -450,6 +453,227 @@ def dl_transcript(config: RuntimeConfig, *, transcript_id: str, timestamp: bool 
     if timestamp:
         return transcript_text
     return _strip_transcript_timestamps(transcript_text)
+
+
+# Mirrors the API's TranscriptChannel enum (0 = Microphone, 1 = Loopback, 2 = External).
+TRANSCRIPT_CHANNELS = {
+    "microphone": 0,
+    "loopback": 1,
+    "external": 2,
+}
+
+PROJECT_TRANSCRIPTS_PAGE_LIMIT = 100
+
+
+def _parse_channel(value: str) -> int:
+    cleaned = value.strip().lower()
+    if cleaned in TRANSCRIPT_CHANNELS:
+        return TRANSCRIPT_CHANNELS[cleaned]
+    if cleaned in {str(channel) for channel in TRANSCRIPT_CHANNELS.values()}:
+        return int(cleaned)
+    valid = ", ".join([*(str(v) for v in TRANSCRIPT_CHANNELS.values()), *TRANSCRIPT_CHANNELS])
+    raise CliError(f"--channel must be one of: {valid}")
+
+
+def _build_assign_speakers_body(
+    *,
+    channel: str,
+    index: int | None,
+    speaker_id: str | None,
+    name: str | None,
+) -> dict[str, Any]:
+    if (speaker_id is None) == (name is None):
+        raise CliError("assign_speakers requires exactly one of --speaker-id or --name")
+
+    body: dict[str, Any] = {"channel": _parse_channel(channel)}
+    if index is not None:
+        if index < 0:
+            raise CliError("--index must be >= 0")
+        body["index"] = index
+    if speaker_id is not None:
+        body["speakerId"] = _clean_required_id(speaker_id, "--speaker-id")
+    else:
+        cleaned_name = (name or "").strip()
+        if not cleaned_name:
+            raise CliError("--name cannot be empty")
+        body["speakerName"] = cleaned_name
+    return body
+
+
+def _fetch_project_transcript_ids(api_url: str, api_token: str, project_id: str) -> list[str]:
+    path = f"/projects/{project_id}/transcripts"
+    transcript_ids: list[str] = []
+    offset = 0
+    while True:
+        payload = _authorized_request(
+            api_url,
+            api_token,
+            "GET",
+            path,
+            params={"offset": offset, "limit": PROJECT_TRANSCRIPTS_PAGE_LIMIT},
+        )
+        items = payload.get("items")
+        if not isinstance(items, list):
+            raise CliError(f"{path} returned JSON object missing array 'items'")
+        for item in items:
+            transcript_id = item.get("id") if isinstance(item, dict) else None
+            if not isinstance(transcript_id, str) or not transcript_id:
+                raise CliError(f"{path} response contains transcript without string 'id'")
+            transcript_ids.append(transcript_id)
+
+        total_count = payload.get("totalCount")
+        offset += len(items)
+        if not items or not isinstance(total_count, int) or offset >= total_count:
+            return transcript_ids
+
+
+def command_assign_speakers(
+    config: RuntimeConfig,
+    *,
+    transcript_id: str | None,
+    project_id: str | None,
+    channel: str,
+    index: int | None,
+    speaker_id: str | None,
+    name: str | None,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    if (transcript_id is None) == (project_id is None):
+        raise CliError("assign_speakers requires exactly one of --transcript-id or --project-id")
+
+    body = _build_assign_speakers_body(channel=channel, index=index, speaker_id=speaker_id, name=name)
+
+    if project_id is not None and index is not None:
+        print(
+            "note: diarization indexes are not stable across transcripts; "
+            "--index with --project-id may match different voices per transcript",
+            file=sys.stderr,
+        )
+
+    if dry_run:
+        if transcript_id is not None:
+            path = f"/transcripts/{_clean_required_id(transcript_id, 'transcript_id')}/assign-speakers"
+        else:
+            cleaned_project_id = _clean_required_id(project_id, "project_id")
+            path = f"/transcripts/{{transcriptId from /projects/{cleaned_project_id}/transcripts}}/assign-speakers"
+        return _dry_run_result("POST", path, body)
+
+    api_url = _require_api_url(config)
+    api_token = _require_api_token(config)
+
+    if transcript_id is not None:
+        cleaned_transcript_id = _clean_required_id(transcript_id, "transcript_id")
+        payload = _authorized_request(
+            api_url,
+            api_token,
+            "POST",
+            f"/transcripts/{cleaned_transcript_id}/assign-speakers",
+            json_body=body,
+            expected_statuses={200, 201},
+        )
+        return dict(payload)
+
+    cleaned_project_id = _clean_required_id(project_id, "project_id")
+    transcript_ids = _fetch_project_transcript_ids(api_url, api_token, cleaned_project_id)
+    results: list[dict[str, Any]] = []
+    assigned_speaker_id: Any = None
+    total_updated = 0
+    for candidate_transcript_id in transcript_ids:
+        payload = _authorized_request(
+            api_url,
+            api_token,
+            "POST",
+            f"/transcripts/{candidate_transcript_id}/assign-speakers",
+            json_body=body,
+            expected_statuses={200, 201},
+        )
+        assigned_speaker_id = payload.get("speakerId")
+        updated_count = payload.get("updatedCaptionCount")
+        if isinstance(updated_count, int):
+            total_updated += updated_count
+        results.append(
+            {"transcriptId": candidate_transcript_id, "updatedCaptionCount": updated_count}
+        )
+
+    return {
+        "speakerId": assigned_speaker_id,
+        "transcriptCount": len(transcript_ids),
+        "totalUpdatedCaptionCount": total_updated,
+        "results": results,
+    }
+
+
+def command_list_speakers(config: RuntimeConfig, *, transcript_id: str) -> dict[str, Any]:
+    api_url = _require_api_url(config)
+    api_token = _require_api_token(config)
+    cleaned_transcript_id = _clean_required_id(transcript_id, "transcript_id")
+
+    captions = _authorized_get_list_of_objects(
+        api_url,
+        api_token,
+        f"/transcripts/{cleaned_transcript_id}/captions",
+    )
+
+    groups: dict[tuple[Any, Any, Any], dict[str, Any]] = {}
+    for caption in captions:
+        key = (caption.get("channel"), caption.get("index"), caption.get("speaker"))
+        group = groups.get(key)
+        if group is None:
+            groups[key] = {
+                "channel": caption.get("channel"),
+                "index": caption.get("index"),
+                "speakerId": caption.get("speaker"),
+                "captionCount": 1,
+                "sample": _truncate_for_cell(caption.get("content", "")),
+            }
+        else:
+            group["captionCount"] += 1
+
+    items = sorted(
+        groups.values(),
+        key=lambda group: (
+            group["channel"] if isinstance(group["channel"], int) else -1,
+            group["index"] if isinstance(group["index"], int) else -1,
+        ),
+    )
+    return {
+        "transcriptId": cleaned_transcript_id,
+        "items": items,
+        "count": len(items),
+    }
+
+
+def command_rename_speaker(
+    config: RuntimeConfig,
+    *,
+    project_id: str,
+    speaker_id: str,
+    name: str,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    cleaned_project_id = _clean_required_id(project_id, "project_id")
+    cleaned_speaker_id = _clean_required_id(speaker_id, "speaker_id")
+    cleaned_name = name.strip()
+    if not cleaned_name:
+        raise CliError("--name cannot be empty")
+
+    body = {"name": cleaned_name}
+    path = f"/projects/{cleaned_project_id}/speakers/{cleaned_speaker_id}"
+    if dry_run:
+        return _dry_run_result("PATCH", path, body)
+
+    api_url = _require_api_url(config)
+    api_token = _require_api_token(config)
+
+    payload = _authorized_request(
+        api_url,
+        api_token,
+        "PATCH",
+        path,
+        json_body=body,
+        expected_statuses={200},
+    )
+    return dict(payload)
 
 
 def command_sync(config: RuntimeConfig, args: Any) -> Any:

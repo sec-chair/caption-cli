@@ -11,6 +11,7 @@ from typing import Any, Mapping, Sequence
 from dotenv import load_dotenv
 
 from caption_cli.commands import (
+    command_assign_speakers,
     command_create_folder,
     command_create_project,
     command_doctor,
@@ -18,6 +19,8 @@ from caption_cli.commands import (
     command_edit_project,
     command_list_folders,
     command_list_projects,
+    command_list_speakers,
+    command_rename_speaker,
     command_search,
     command_sync,
     command_token,
@@ -116,7 +119,8 @@ def _top_level_help_epilog(specs: Sequence[CommandSpec]) -> str:
         "  --cache-path CACHE_PATH  search token cache path (default: search-token.json)",
         (
             "  --output {json,table,md} output format "
-            "(default: json, except search/list_projects/list_folders/list_matters=table and dl_transcript/get_md=md)"
+            "(default: json, except search/list_projects/list_folders/list_matters/list_speakers=table "
+            "and dl_transcript/get_md=md)"
         ),
         "  --output-file PATH      write rendered output to PATH for large outputs like list_projects, list_folders, list_matters, dl_transcript, get_md",
         "",
@@ -423,6 +427,47 @@ def _add_dl_transcript_arguments(parser: argparse.ArgumentParser) -> None:
     _add_api_auth_arguments(parser)
 
 
+def _add_assign_speakers_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--transcript-id", default=None, help="Transcript UUID to assign within")
+    parser.add_argument(
+        "--project-id",
+        default=None,
+        help="Project UUID; assigns across every transcript in the project",
+    )
+    parser.add_argument(
+        "--channel",
+        required=True,
+        help="Capture channel: 0|microphone, 1|loopback, 2|external",
+    )
+    parser.add_argument(
+        "--index",
+        type=int,
+        default=None,
+        help="Diarization index to filter by; omit to update all indexes in the channel",
+    )
+    parser.add_argument("--speaker-id", default=None, help="Existing speaker UUID to assign")
+    parser.add_argument(
+        "--name",
+        default=None,
+        help="Speaker name; reuses or creates a custom speaker in the transcript's project",
+    )
+    _add_api_auth_arguments(parser)
+    _add_dry_run_flag(parser)
+
+
+def _add_list_speakers_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("transcript_id", help="Transcript UUID")
+    _add_api_auth_arguments(parser)
+
+
+def _add_rename_speaker_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("project_id", help="Project UUID")
+    parser.add_argument("speaker_id", help="Speaker UUID")
+    parser.add_argument("--name", required=True, help="New speaker name")
+    _add_api_auth_arguments(parser)
+    _add_dry_run_flag(parser)
+
+
 def _add_sync_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--db-path", default=str(default_db_path()), help="SQLite sessions database path")
     parser.add_argument("--session-id", required=True, help="Case-insensitive session ID substring, or * for all")
@@ -580,6 +625,33 @@ def _handle_edit_folder(config: RuntimeConfig, args: argparse.Namespace) -> dict
 
 def _handle_dl_transcript(config: RuntimeConfig, args: argparse.Namespace) -> Any:
     return dl_transcript(config, transcript_id=args.transcript_id, timestamp=args.timestamp)
+
+
+def _handle_assign_speakers(config: RuntimeConfig, args: argparse.Namespace) -> dict[str, Any]:
+    return command_assign_speakers(
+        config,
+        transcript_id=args.transcript_id,
+        project_id=args.project_id,
+        channel=args.channel,
+        index=args.index,
+        speaker_id=args.speaker_id,
+        name=args.name,
+        dry_run=args.dry_run,
+    )
+
+
+def _handle_list_speakers(config: RuntimeConfig, args: argparse.Namespace) -> dict[str, Any]:
+    return command_list_speakers(config, transcript_id=args.transcript_id)
+
+
+def _handle_rename_speaker(config: RuntimeConfig, args: argparse.Namespace) -> dict[str, Any]:
+    return command_rename_speaker(
+        config,
+        project_id=args.project_id,
+        speaker_id=args.speaker_id,
+        name=args.name,
+        dry_run=args.dry_run,
+    )
 
 
 def _handle_sync(config: RuntimeConfig, args: argparse.Namespace) -> Any:
@@ -865,6 +937,54 @@ def _command_specs() -> Sequence[CommandSpec]:
                 "Pass --timestamp to preserve them in output.",
             ),
             example="caption --output json dl_transcript <transcript-uuid>",
+        ),
+        CommandSpec(
+            name="assign_speakers",
+            help="Assign a speaker to transcript captions by channel and optional diarization index",
+            add_arguments=_add_assign_speakers_arguments,
+            handler=_handle_assign_speakers,
+            usage=(
+                "caption assign_speakers (--transcript-id UUID | --project-id UUID) "
+                "--channel {0|1|2|microphone|loopback|external} [--index N] "
+                "(--speaker-id UUID | --name TEXT) [--dry-run]"
+            ),
+            notes=(
+                "POSTs to /transcripts/{transcriptId}/assign-speakers.",
+                "--name reuses or creates a custom speaker scoped to the transcript's project (preferred).",
+                "--speaker-id is not project-ownership-checked by the API; only pass IDs from the same project.",
+                "--project-id fans out over every transcript in the project and aggregates the results.",
+                "Omitting --index updates all diarization indexes in the channel.",
+                "--dry-run validates inputs and prints {dry_run, method, path, body} without sending.",
+            ),
+            example="caption assign_speakers --transcript-id <transcript-uuid> --channel microphone --index 1 --name Alice",
+        ),
+        CommandSpec(
+            name="list_speakers",
+            help="Summarize speaker assignments for a transcript's captions",
+            add_arguments=_add_list_speakers_arguments,
+            handler=_handle_list_speakers,
+            default_output="table",
+            usage="caption list_speakers <transcript_id>",
+            notes=(
+                "Derives (channel, index, speakerId) groups from GET /transcripts/{transcriptId}/captions.",
+                "Shows speaker IDs only; caption payloads do not include speaker names.",
+                "Use it to pick --channel/--index targets before assign_speakers.",
+            ),
+            example="caption list_speakers <transcript-uuid>",
+        ),
+        CommandSpec(
+            name="rename_speaker",
+            help="Rename a custom speaker across a project",
+            add_arguments=_add_rename_speaker_arguments,
+            handler=_handle_rename_speaker,
+            usage="caption rename_speaker <project_id> <speaker_id> --name TEXT [--dry-run]",
+            notes=(
+                "PATCHes /projects/{projectId}/speakers/{speakerId}.",
+                "Only custom speakers can be renamed; user-backed speakers are rejected by the API.",
+                "The rename applies to every caption using the speaker within the project.",
+                "--dry-run validates inputs and prints {dry_run, method, path, body} without sending.",
+            ),
+            example="caption rename_speaker <project-uuid> <speaker-uuid> --name \"Alice\"",
         ),
         CommandSpec(
             name="list_matters",
