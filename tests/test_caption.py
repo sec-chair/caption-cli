@@ -1769,6 +1769,18 @@ def test_emit_output_table_renders_hosted_markdown_documents_collection(
     )
 
 
+def test_emit_output_table_renders_transcript_id_for_empty_list_speakers(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    core.emit_output(
+        {"transcriptId": "t1", "items": [], "count": 0},
+        "table",
+        command_name="list_speakers",
+    )
+
+    assert capsys.readouterr().out == "transcriptId: t1\ncount: 0\n"
+
+
 def test_command_edit_project_requires_update_fields(config: core.RuntimeConfig) -> None:
     with pytest.raises(core.CliError, match="edit_project requires at least one field"):
         commands.command_edit_project(
@@ -2504,11 +2516,27 @@ def test_command_assign_speakers_project_mode_paginates_and_aggregates(
     monkeypatch: pytest.MonkeyPatch,
     config: core.RuntimeConfig,
 ) -> None:
-    request_calls: list[tuple[str, str, object, object]] = []
+    get_calls: list[tuple[str, object]] = []
+    post_calls: list[tuple[str, str, object, object]] = []
+    client_ids: set[int] = set()
     transcript_pages = {
-        0: {"items": [{"id": f"t{i}"} for i in range(100)], "totalCount": 101},
-        100: {"items": [{"id": "t100"}], "totalCount": 101},
+        0: {"items": [{"id": f"t{i}"} for i in range(100)]},
+        100: {"items": [{"id": "t100"}]},
     }
+
+    def fake_authorized_get_json(
+        api_url: str,
+        api_token: str,
+        path: str,
+        params=None,
+        client=None,
+    ) -> dict[str, object]:
+        assert path == "/projects/p1/transcripts"
+        assert params["limit"] == 100
+        assert client is not None
+        client_ids.add(id(client))
+        get_calls.append((path, params))
+        return transcript_pages[params["offset"]]
 
     def fake_authorized_request(
         api_url: str,
@@ -2518,14 +2546,14 @@ def test_command_assign_speakers_project_mode_paginates_and_aggregates(
         params=None,
         json_body=None,
         expected_statuses=None,
+        client=None,
     ) -> dict[str, object]:
-        request_calls.append((method, path, params, json_body))
-        if method == "GET":
-            assert path == "/projects/p1/transcripts"
-            assert params["limit"] == 100
-            return transcript_pages[params["offset"]]
+        assert client is not None
+        client_ids.add(id(client))
+        post_calls.append((method, path, json_body, expected_statuses))
         return {"speakerId": "speaker-uuid", "updatedCaptionCount": 2}
 
+    monkeypatch.setattr(commands, "_authorized_get_json", fake_authorized_get_json)
     monkeypatch.setattr(commands, "_authorized_request", fake_authorized_request)
 
     result = commands.command_assign_speakers(
@@ -2539,16 +2567,93 @@ def test_command_assign_speakers_project_mode_paginates_and_aggregates(
         dry_run=False,
     )
 
-    get_calls = [call for call in request_calls if call[0] == "GET"]
-    post_calls = [call for call in request_calls if call[0] == "POST"]
     assert len(get_calls) == 2
     assert len(post_calls) == 101
     assert post_calls[0][1] == "/transcripts/t0/assign-speakers"
     assert post_calls[-1][1] == "/transcripts/t100/assign-speakers"
+    assert len(client_ids) == 1
     assert result["speakerId"] == "speaker-uuid"
     assert result["transcriptCount"] == 101
+    assert result["successCount"] == 101
+    assert result["failureCount"] == 0
     assert result["totalUpdatedCaptionCount"] == 202
+    assert result["failures"] == []
     assert result["results"][0] == {"transcriptId": "t0", "updatedCaptionCount": 2}
+
+
+def test_command_assign_speakers_project_mode_reports_partial_failures(
+    monkeypatch: pytest.MonkeyPatch,
+    config: core.RuntimeConfig,
+) -> None:
+    post_paths: list[str] = []
+
+    def fake_authorized_get_json(
+        api_url: str,
+        api_token: str,
+        path: str,
+        params=None,
+        client=None,
+    ) -> dict[str, object]:
+        assert path == "/projects/p1/transcripts"
+        return {"items": [{"id": "t1"}, {"id": "t2"}, {"id": "t3"}]}
+
+    def fake_authorized_request(
+        api_url: str,
+        api_token: str,
+        method: str,
+        path: str,
+        params=None,
+        json_body=None,
+        expected_statuses=None,
+        client=None,
+    ) -> dict[str, object]:
+        post_paths.append(path)
+        if path == "/transcripts/t2/assign-speakers":
+            raise core.CliError(
+                "Failed POST /transcripts/t2/assign-speakers (500): boom",
+                exit_code=core.EXIT_UPSTREAM,
+            )
+        return {"speakerId": "speaker-uuid", "updatedCaptionCount": 3}
+
+    monkeypatch.setattr(commands, "_authorized_get_json", fake_authorized_get_json)
+    monkeypatch.setattr(commands, "_authorized_request", fake_authorized_request)
+
+    with pytest.raises(core.CliError) as excinfo:
+        commands.command_assign_speakers(
+            config,
+            transcript_id=None,
+            project_id="p1",
+            channel="0",
+            index=None,
+            speaker_id=None,
+            name="Alice",
+            dry_run=False,
+        )
+
+    assert post_paths == [
+        "/transcripts/t1/assign-speakers",
+        "/transcripts/t2/assign-speakers",
+        "/transcripts/t3/assign-speakers",
+    ]
+    assert excinfo.value.exit_code == core.EXIT_UPSTREAM
+    prefix = "assign_speakers project fan-out failed: "
+    assert excinfo.value.message.startswith(prefix)
+    report = json.loads(excinfo.value.message.removeprefix(prefix))
+    assert report["transcriptCount"] == 3
+    assert report["successCount"] == 2
+    assert report["failureCount"] == 1
+    assert report["totalUpdatedCaptionCount"] == 6
+    assert report["results"] == [
+        {"transcriptId": "t1", "updatedCaptionCount": 3},
+        {"transcriptId": "t3", "updatedCaptionCount": 3},
+    ]
+    assert report["failures"] == [
+        {
+            "transcriptId": "t2",
+            "error": "Failed POST /transcripts/t2/assign-speakers (500): boom",
+            "exitCode": core.EXIT_UPSTREAM,
+        }
+    ]
 
 
 def test_command_list_speakers_groups_captions_by_channel_index_and_speaker(
@@ -2562,11 +2667,18 @@ def test_command_list_speakers_groups_captions_by_channel_index_and_speaker(
         {"channel": 0, "index": 0, "speaker": None, "content": "unassigned mic caption"},
     ]
 
-    def fake_get_list(api_url: str, api_token: str, path: str) -> list[dict[str, object]]:
+    def fake_fetch_list(
+        api_url: str,
+        api_token: str,
+        path: str,
+        *,
+        client=None,
+        page_limit: int = commands.PROJECT_TRANSCRIPTS_PAGE_LIMIT,
+    ) -> list[dict[str, object]]:
         assert path == "/transcripts/t1/captions"
         return captions
 
-    monkeypatch.setattr(commands, "_authorized_get_list_of_objects", fake_get_list)
+    monkeypatch.setattr(commands, "_fetch_paginated_object_list", fake_fetch_list)
 
     result = commands.command_list_speakers(config, transcript_id="t1")
 
@@ -2595,6 +2707,84 @@ def test_command_list_speakers_groups_captions_by_channel_index_and_speaker(
             "sample": "hello from loopback",
         },
     ]
+
+
+def test_command_list_speakers_paginates_caption_pages_and_ignores_null_sample(
+    monkeypatch: pytest.MonkeyPatch,
+    config: core.RuntimeConfig,
+) -> None:
+    first_page = [
+        {"channel": 0, "index": 0, "speaker": "s1", "content": None},
+        *[
+            {"channel": 0, "index": 0, "speaker": "s1", "content": f"caption {i}"}
+            for i in range(99)
+        ],
+    ]
+    second_page = [
+        {"channel": 1, "index": 0, "speaker": None, "content": "loopback caption"},
+    ]
+    pages = {0: {"items": first_page}, 100: {"items": second_page}}
+    get_offsets: list[int] = []
+
+    def fake_authorized_get_json(
+        api_url: str,
+        api_token: str,
+        path: str,
+        params=None,
+        client=None,
+    ) -> dict[str, object]:
+        assert path == "/transcripts/t1/captions"
+        assert params["limit"] == 100
+        get_offsets.append(params["offset"])
+        return pages[params["offset"]]
+
+    monkeypatch.setattr(commands, "_authorized_get_json", fake_authorized_get_json)
+
+    result = commands.command_list_speakers(config, transcript_id="t1")
+
+    assert get_offsets == [0, 100]
+    assert result["items"] == [
+        {
+            "channel": 0,
+            "index": 0,
+            "speakerId": "s1",
+            "captionCount": 100,
+            "sample": "",
+        },
+        {
+            "channel": 1,
+            "index": 0,
+            "speakerId": None,
+            "captionCount": 1,
+            "sample": "loopback caption",
+        },
+    ]
+
+
+def test_fetch_paginated_object_list_rejects_non_advancing_pagination(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    full_page = {"items": [{"channel": 0, "index": 0, "content": f"caption {i}"} for i in range(100)]}
+    get_offsets: list[int] = []
+
+    def fake_authorized_get_json(
+        api_url: str,
+        api_token: str,
+        path: str,
+        params=None,
+        client=None,
+    ) -> dict[str, object]:
+        get_offsets.append(params["offset"])
+        return full_page
+
+    monkeypatch.setattr(commands, "_authorized_get_json", fake_authorized_get_json)
+
+    with pytest.raises(core.CliError) as excinfo:
+        commands._fetch_paginated_object_list("https://api", "token", "/transcripts/t1/captions")
+
+    assert get_offsets == [0, 100]
+    assert excinfo.value.exit_code == core.EXIT_UPSTREAM
+    assert "pagination did not advance at offset 100" in excinfo.value.message
 
 
 def test_rename_speaker_dry_run_previews_patch(config: core.RuntimeConfig) -> None:

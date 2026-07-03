@@ -132,13 +132,19 @@ def _authorized_request(
     api_token: str,
     method: str,
     path: str,
-    params: Mapping[str, int] | None = None,
+    params: Mapping[str, Any] | None = None,
     json_body: Mapping[str, Any] | None = None,
     expected_statuses: set[int] | None = None,
+    client: httpx.Client | None = None,
 ) -> Mapping[str, Any]:
     url = f"{api_url.rstrip('/')}/{path.lstrip('/')}"
     headers = {"Authorization": f"Bearer {api_token}"}
-    with httpx.Client(timeout=15.0) as client:
+    if client is None:
+        with httpx.Client(timeout=15.0) as request_client:
+            response = request_client.request(
+                method, url, headers=headers, params=params, json=json_body
+            )
+    else:
         response = client.request(
             method, url, headers=headers, params=params, json=json_body
         )
@@ -164,9 +170,34 @@ def _authorized_get(
     api_url: str,
     api_token: str,
     path: str,
-    params: Mapping[str, int] | None = None,
+    params: Mapping[str, Any] | None = None,
 ) -> Mapping[str, Any]:
     return _authorized_request(api_url, api_token, "GET", path, params=params)
+
+
+def _authorized_get_json(
+    api_url: str,
+    api_token: str,
+    path: str,
+    params: Mapping[str, Any] | None = None,
+    client: httpx.Client | None = None,
+) -> Any:
+    url = f"{api_url.rstrip('/')}/{path.lstrip('/')}"
+    headers = {"Authorization": f"Bearer {api_token}"}
+    if client is None:
+        with httpx.Client(timeout=15.0) as request_client:
+            response = request_client.get(url, headers=headers, params=params)
+    else:
+        response = client.get(url, headers=headers, params=params)
+
+    if response.status_code != 200:
+        detail = response.text.strip() or response.reason_phrase
+        raise CliError(
+            f"Failed GET {path} ({response.status_code}): {detail}",
+            exit_code=_exit_code_for_status(response.status_code),
+        )
+
+    return response.json()
 
 
 def _authorized_get_text(
@@ -194,20 +225,13 @@ def _authorized_get_list_of_objects(
     api_url: str,
     api_token: str,
     path: str,
+    params: Mapping[str, Any] | None = None,
+    client: httpx.Client | None = None,
 ) -> list[Mapping[str, Any]]:
-    url = f"{api_url.rstrip('/')}/{path.lstrip('/')}"
-    headers = {"Authorization": f"Bearer {api_token}"}
-    with httpx.Client(timeout=15.0) as client:
-        response = client.get(url, headers=headers)
-
-    if response.status_code != 200:
-        detail = response.text.strip() or response.reason_phrase
-        raise CliError(
-            f"Failed GET {path} ({response.status_code}): {detail}",
-            exit_code=_exit_code_for_status(response.status_code),
-        )
-
-    return _extract_object_list(response.json(), path)
+    return _extract_object_list(
+        _authorized_get_json(api_url, api_token, path, params=params, client=client),
+        path,
+    )
 
 
 def _extract_object_list(payload: Any, path: str) -> list[Mapping[str, Any]]:
@@ -389,9 +413,10 @@ def _render_table(value: Any, *, command_name: str | None = None) -> str:
             items = value.get("documents")
         if isinstance(items, list) and all(isinstance(item, dict) for item in items):
             lines: list[str] = []
-            workspace_id = value.get("workspaceId")
-            if workspace_id:
-                lines.append(f"workspaceId: {workspace_id}")
+            for metadata_key in ("workspaceId", "transcriptId"):
+                metadata_value = value.get(metadata_key)
+                if metadata_value:
+                    lines.append(f"{metadata_key}: {metadata_value}")
             lines.append(f"count: {len(items)}")
             if not items:
                 return "\n".join(lines)
@@ -423,6 +448,8 @@ def _render_table(value: Any, *, command_name: str | None = None) -> str:
 
 
 def _truncate_for_cell(value: Any, *, limit: int = 72) -> str:
+    if value is None:
+        return ""
     text = str(value).replace("\n", " ").strip()
     if len(text) <= limit:
         return text

@@ -110,6 +110,7 @@ def _agentsview_request(
     expected_statuses: set[int],
     transport: httpx.BaseTransport | None = None,
     base_url: str = AGENTSVIEW_BASE_URL,
+    client: httpx.Client | None = None,
 ) -> Mapping[str, Any] | None:
     clerk_api_key, org_id = auth
     url = f"{base_url.rstrip('/')}/{path.lstrip('/')}"
@@ -120,7 +121,10 @@ def _agentsview_request(
         "Content-Type": "application/json",
         "User-Agent": AGENTSVIEW_USER_AGENT,
     }
-    with httpx.Client(timeout=30.0, transport=transport) as client:
+    if client is None:
+        with httpx.Client(timeout=30.0, transport=transport) as request_client:
+            response = request_client.request(method, url, headers=headers, params=params, json=json_body)
+    else:
         response = client.request(method, url, headers=headers, params=params, json=json_body)
 
     if response.status_code not in expected_statuses:
@@ -519,6 +523,7 @@ def send_payload(
     payload: dict[str, object],
     *,
     transport: httpx.BaseTransport | None = None,
+    client: httpx.Client | None = None,
 ) -> None:
     session_payload = payload.get("session")
     if not isinstance(session_payload, dict):
@@ -534,6 +539,7 @@ def send_payload(
         expected_statuses={204},
         transport=transport,
         base_url=base_url,
+        client=client,
     )
 
 
@@ -548,16 +554,17 @@ def send_payloads(
     sent: list[dict[str, object]] = []
     failures: list[dict[str, object]] = []
 
-    for payload in payloads:
-        share_id = payload.get("share_id")
-        if not isinstance(share_id, str) or not share_id:
-            raise CliError("Payload missing share_id")
-        try:
-            send_payload(base_url, clerk_api_key, org_id, share_id, payload, transport=transport)
-        except CliError as exc:
-            failures.append({"share_id": share_id, "error": exc.message})
-            continue
-        sent.append({"share_id": share_id, "url": f"{base_url.rstrip('/')}/sessions/{share_id}"})
+    with httpx.Client(timeout=30.0, transport=transport) as client:
+        for payload in payloads:
+            share_id = payload.get("share_id")
+            if not isinstance(share_id, str) or not share_id:
+                raise CliError("Payload missing share_id")
+            try:
+                send_payload(base_url, clerk_api_key, org_id, share_id, payload, client=client)
+            except CliError as exc:
+                failures.append({"share_id": share_id, "error": exc.message})
+                continue
+            sent.append({"share_id": share_id, "url": f"{base_url.rstrip('/')}/sessions/{share_id}"})
 
     return {"sent_count": len(sent), "failed_count": len(failures), "sent": sent, "failures": failures}
 
@@ -598,9 +605,15 @@ def command_sync(_: Any, args: argparse.Namespace) -> object:
         return payloads
 
     clerk_api_key, org_id = _agentsview_auth(args)
-    return send_payloads(
+    result = send_payloads(
         payloads,
         base_url=AGENTSVIEW_BASE_URL,
         clerk_api_key=clerk_api_key,
         org_id=org_id,
     )
+    if result["failed_count"]:
+        raise CliError(
+            f"sync send failed: {json.dumps(result, ensure_ascii=True, sort_keys=True)}",
+            exit_code=EXIT_UPSTREAM,
+        )
+    return result

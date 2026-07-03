@@ -1018,6 +1018,7 @@ def _command_specs() -> Sequence[CommandSpec]:
                 "--project-name overrides session.project in every built payload.",
                 "Use --test (alias: --dry-run) to print the built JSON payloads without sending anything.",
                 "Without --test, builds payloads from the local SQLite DB, then PUTs them to https://history.caption.fyi/api/v1/shares/{session_id}.",
+                "Exits 4 (upstream failure) when any session fails to send; the error message embeds the full sent/failures report.",
             ),
             example="caption sync --session-id s1 --org-id org_123",
         ),

@@ -207,7 +207,8 @@ Behavior:
 - `--session-id '*'` selects all non-deleted sessions
 - `--project-name` overrides the built payload's `session.project` for every matched session
 - `--test` prints the built JSON payloads and does not require send auth
-- without `--test`, the command sends payloads to `https://history.caption.fyi`
+- without `--test`, the command sends payloads to `https://history.caption.fyi` over a single reused HTTP connection
+- if any session fails to send, the command exits `4` (upstream failure) and the error message embeds the full sent/failures report
 
 This command does not require `CAPTION_API_URL` or `CAPTION_MEILI_URL`.
 

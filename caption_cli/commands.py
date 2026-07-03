@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import re
 import sys
@@ -12,10 +13,12 @@ import meilisearch
 from caption_cli import agentsview
 from caption_cli.core import (
     CliError,
+    EXIT_UPSTREAM,
     RuntimeConfig,
-    _authorized_get_list_of_objects,
+    _authorized_get_json,
     _authorized_get_text,
     _authorized_request,
+    _extract_object_list,
     _folder_view,
     _project_view,
     _require_api_token,
@@ -493,38 +496,58 @@ def _build_assign_speakers_body(
     if speaker_id is not None:
         body["speakerId"] = _clean_required_id(speaker_id, "--speaker-id")
     else:
-        cleaned_name = (name or "").strip()
-        if not cleaned_name:
-            raise CliError("--name cannot be empty")
-        body["speakerName"] = cleaned_name
+        body["speakerName"] = _clean_required_id(name or "", "--name")
     return body
 
 
-def _fetch_project_transcript_ids(api_url: str, api_token: str, project_id: str) -> list[str]:
-    path = f"/projects/{project_id}/transcripts"
-    transcript_ids: list[str] = []
+def _fetch_paginated_object_list(
+    api_url: str,
+    api_token: str,
+    path: str,
+    *,
+    client: httpx.Client | None = None,
+    page_limit: int = PROJECT_TRANSCRIPTS_PAGE_LIMIT,
+) -> list[Mapping[str, Any]]:
+    items: list[Mapping[str, Any]] = []
     offset = 0
+    previous_page: list[Mapping[str, Any]] | None = None
     while True:
-        payload = _authorized_request(
+        payload = _authorized_get_json(
             api_url,
             api_token,
-            "GET",
             path,
-            params={"offset": offset, "limit": PROJECT_TRANSCRIPTS_PAGE_LIMIT},
+            params={"offset": offset, "limit": page_limit},
+            client=client,
         )
-        items = payload.get("items")
-        if not isinstance(items, list):
-            raise CliError(f"{path} returned JSON object missing array 'items'")
-        for item in items:
-            transcript_id = item.get("id") if isinstance(item, dict) else None
-            if not isinstance(transcript_id, str) or not transcript_id:
-                raise CliError(f"{path} response contains transcript without string 'id'")
-            transcript_ids.append(transcript_id)
+        page_items = _extract_object_list(payload, path)
+        if offset and page_items == previous_page:
+            raise CliError(
+                f"{path} pagination did not advance at offset {offset}; "
+                "the endpoint may ignore offset/limit",
+                exit_code=EXIT_UPSTREAM,
+            )
+        previous_page = page_items
+        items.extend(page_items)
+        if isinstance(payload, list) or len(page_items) < page_limit:
+            return items
+        offset += len(page_items)
 
-        total_count = payload.get("totalCount")
-        offset += len(items)
-        if not items or not isinstance(total_count, int) or offset >= total_count:
-            return transcript_ids
+
+def _fetch_project_transcript_ids(
+    api_url: str,
+    api_token: str,
+    project_id: str,
+    *,
+    client: httpx.Client | None = None,
+) -> list[str]:
+    path = f"/projects/{project_id}/transcripts"
+    transcript_ids: list[str] = []
+    for item in _fetch_paginated_object_list(api_url, api_token, path, client=client):
+        transcript_id = item.get("id")
+        if not isinstance(transcript_id, str) or not transcript_id:
+            raise CliError(f"{path} response contains transcript without string 'id'")
+        transcript_ids.append(transcript_id)
+    return transcript_ids
 
 
 def command_assign_speakers(
@@ -574,33 +597,71 @@ def command_assign_speakers(
         return dict(payload)
 
     cleaned_project_id = _clean_required_id(project_id, "project_id")
-    transcript_ids = _fetch_project_transcript_ids(api_url, api_token, cleaned_project_id)
-    results: list[dict[str, Any]] = []
-    assigned_speaker_id: Any = None
-    total_updated = 0
-    for candidate_transcript_id in transcript_ids:
-        payload = _authorized_request(
+    with httpx.Client(timeout=15.0) as client:
+        transcript_ids = _fetch_project_transcript_ids(
             api_url,
             api_token,
-            "POST",
-            f"/transcripts/{candidate_transcript_id}/assign-speakers",
-            json_body=body,
-            expected_statuses={200, 201},
+            cleaned_project_id,
+            client=client,
         )
-        assigned_speaker_id = payload.get("speakerId")
-        updated_count = payload.get("updatedCaptionCount")
-        if isinstance(updated_count, int):
-            total_updated += updated_count
-        results.append(
-            {"transcriptId": candidate_transcript_id, "updatedCaptionCount": updated_count}
-        )
+        results: list[dict[str, Any]] = []
+        failures: list[dict[str, Any]] = []
+        assigned_speaker_id: Any = None
+        total_updated = 0
+        for candidate_transcript_id in transcript_ids:
+            try:
+                payload = _authorized_request(
+                    api_url,
+                    api_token,
+                    "POST",
+                    f"/transcripts/{candidate_transcript_id}/assign-speakers",
+                    json_body=body,
+                    expected_statuses={200, 201},
+                    client=client,
+                )
+            except CliError as exc:
+                failures.append(
+                    {
+                        "transcriptId": candidate_transcript_id,
+                        "error": exc.message,
+                        "exitCode": exc.exit_code,
+                    }
+                )
+                continue
+            except httpx.HTTPError as exc:
+                failures.append(
+                    {
+                        "transcriptId": candidate_transcript_id,
+                        "error": str(exc),
+                        "exitCode": EXIT_UPSTREAM,
+                    }
+                )
+                continue
 
-    return {
+            assigned_speaker_id = payload.get("speakerId")
+            updated_count = payload.get("updatedCaptionCount")
+            if isinstance(updated_count, int):
+                total_updated += updated_count
+            results.append(
+                {"transcriptId": candidate_transcript_id, "updatedCaptionCount": updated_count}
+            )
+
+    result = {
         "speakerId": assigned_speaker_id,
         "transcriptCount": len(transcript_ids),
+        "successCount": len(results),
+        "failureCount": len(failures),
         "totalUpdatedCaptionCount": total_updated,
         "results": results,
+        "failures": failures,
     }
+    if failures:
+        raise CliError(
+            "assign_speakers project fan-out failed: "
+            f"{json.dumps(result, ensure_ascii=True, sort_keys=True)}",
+            exit_code=EXIT_UPSTREAM,
+        )
+    return result
 
 
 def command_list_speakers(config: RuntimeConfig, *, transcript_id: str) -> dict[str, Any]:
@@ -608,11 +669,13 @@ def command_list_speakers(config: RuntimeConfig, *, transcript_id: str) -> dict[
     api_token = _require_api_token(config)
     cleaned_transcript_id = _clean_required_id(transcript_id, "transcript_id")
 
-    captions = _authorized_get_list_of_objects(
-        api_url,
-        api_token,
-        f"/transcripts/{cleaned_transcript_id}/captions",
-    )
+    with httpx.Client(timeout=15.0) as client:
+        captions = _fetch_paginated_object_list(
+            api_url,
+            api_token,
+            f"/transcripts/{cleaned_transcript_id}/captions",
+            client=client,
+        )
 
     groups: dict[tuple[Any, Any, Any], dict[str, Any]] = {}
     for caption in captions:
@@ -653,9 +716,7 @@ def command_rename_speaker(
 ) -> dict[str, Any]:
     cleaned_project_id = _clean_required_id(project_id, "project_id")
     cleaned_speaker_id = _clean_required_id(speaker_id, "speaker_id")
-    cleaned_name = name.strip()
-    if not cleaned_name:
-        raise CliError("--name cannot be empty")
+    cleaned_name = _clean_required_id(name, "--name")
 
     body = {"name": cleaned_name}
     path = f"/projects/{cleaned_project_id}/speakers/{cleaned_speaker_id}"

@@ -492,6 +492,68 @@ def test_send_payloads_returns_frontend_session_url_after_api_put() -> None:
     }
 
 
+def test_agentsview_request_uses_provided_client() -> None:
+    request_urls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        request_urls.append(str(request.url))
+        return httpx.Response(status_code=204)
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        result = agentsview._agentsview_request(
+            "PUT",
+            "/api/v1/shares/s1",
+            auth=("test-token", "org_123"),
+            json_body={},
+            expected_statuses={204},
+            client=client,
+        )
+
+    assert result is None
+    assert request_urls == ["https://history.caption.fyi/api/v1/shares/s1"]
+
+
+def test_send_payloads_shares_one_client_across_sends(monkeypatch: pytest.MonkeyPatch) -> None:
+    payloads = [
+        {
+            "share_id": f"s{i}",
+            "session": {"id": f"s{i}", "project": "proj", "agent": "codex", "message_count": 1, "user_message_count": 1},
+            "messages": [],
+        }
+        for i in range(3)
+    ]
+    clients: list[object] = []
+
+    def fake_agentsview_request(
+        method: str,
+        path: str,
+        *,
+        auth: tuple[str, str],
+        params: object = None,
+        json_body: object = None,
+        expected_statuses: set[int],
+        transport: httpx.BaseTransport | None = None,
+        base_url: str = agentsview.AGENTSVIEW_BASE_URL,
+        client: httpx.Client | None = None,
+    ) -> None:
+        clients.append(client)
+        return None
+
+    monkeypatch.setattr(agentsview, "_agentsview_request", fake_agentsview_request)
+
+    result = agentsview.send_payloads(
+        payloads,
+        base_url=agentsview.AGENTSVIEW_BASE_URL,
+        clerk_api_key="test-token",
+        org_id="org_123",
+    )
+
+    assert result["sent_count"] == 3
+    assert len(clients) == 3
+    assert clients[0] is not None
+    assert all(client is clients[0] for client in clients)
+
+
 @pytest.mark.parametrize(
     ("status_code", "body", "match"),
     [
@@ -602,6 +664,44 @@ def test_command_sync_uses_env_auth_when_flags_are_omitted(
     assert payload["session"]["id"] == "s1"
     assert payload["session"]["project"] == "proj"
     assert len(payload["messages"]) == 2
+
+
+def test_command_sync_raises_upstream_error_when_sends_fail(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "sessions.db"
+    make_agentsview_db(db_path)
+    monkeypatch.setenv("CLERK_API_KEY", "env-token")
+    monkeypatch.setenv("ORGANIZATION_ID", "env-org")
+
+    report = {
+        "sent_count": 0,
+        "failed_count": 1,
+        "sent": [],
+        "failures": [{"share_id": "s1", "error": "Failed PUT /api/v1/shares/s1 (500): boom"}],
+    }
+
+    def fake_send_payloads(
+        payloads: list[dict[str, object]],
+        *,
+        base_url: str,
+        clerk_api_key: str,
+        org_id: str,
+        transport: httpx.BaseTransport | None = None,
+    ) -> dict[str, object]:
+        return report
+
+    monkeypatch.setattr(agentsview, "send_payloads", fake_send_payloads)
+
+    args = cli.parse_args(["--env-file", "", "sync", "--db-path", str(db_path), "--session-id", "s1"])
+    with pytest.raises(core.CliError) as excinfo:
+        agentsview.command_sync(None, args)
+
+    assert excinfo.value.exit_code == core.EXIT_UPSTREAM
+    prefix = "sync send failed: "
+    assert excinfo.value.message.startswith(prefix)
+    assert json.loads(excinfo.value.message.removeprefix(prefix)) == report
 
 
 def test_command_sync_project_name_overrides_payload_project(
