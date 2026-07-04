@@ -22,7 +22,7 @@ EXIT_NOT_FOUND = 5
 
 DEFAULT_CACHE_PATH = "search-token.json"
 DEFAULT_LIMIT = 1000
-DEFAULT_SEARCH_INDEX = "transcript_sessions_v2"
+DEFAULT_SEARCH_INDEX = "transcript_blocks_v2"
 PROJECT_OUTPUT_FIELDS = (
     "id",
     "transcript",

@@ -486,9 +486,12 @@ def test_search_help_lists_supported_indices(capsys: pytest.CaptureFixture[str])
         cli.parse_args(["search", "--help"])
 
     captured = capsys.readouterr()
-    assert "workspace_folders_v1" in captured.out
-    assert "projects_v1" in captured.out
-    assert "transcript_sessions_v1" in captured.out
+    assert core.DEFAULT_SEARCH_INDEX in captured.out
+    assert "transcript_blocks_v2" in captured.out
+    assert "transcript_captions_v1" not in captured.out
+    assert "workspace_folders_v1" not in captured.out
+    assert "projects_v1" not in captured.out
+    assert "transcript_sessions_v1" not in captured.out
 
 
 def test_search_command_rejects_limit_lt_1() -> None:
@@ -870,7 +873,10 @@ def test_subcommand_help_includes_notes_example_and_default_output(
     output = capsys.readouterr().out
     assert "default output: table" in output
     assert "Uses cached token and refreshes once on Meili auth failures." in output
-    assert 'example: caption search "roadmap" --index projects_v1 --limit 10' in output
+    assert (
+        f'example: caption search "roadmap" --index {core.DEFAULT_SEARCH_INDEX} --limit 10'
+        in output
+    )
 
 
 def test_top_level_help_has_agent_quick_start(capsys: pytest.CaptureFixture[str]) -> None:
