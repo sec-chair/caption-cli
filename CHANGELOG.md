@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.1](https://github.com/sec-chair/caption-cli/compare/v0.2.0...v0.2.1) (2026-07-04)
+
+
+### Bug Fixes
+
+* update search help ([00a06e7](https://github.com/sec-chair/caption-cli/commit/00a06e7ef5f297e4e9df52c0ca0d3bb4814729e8))
+
 ## [0.2.0](https://github.com/sec-chair/caption-cli/compare/v0.1.0...v0.2.0) (2026-07-04)
 
 
