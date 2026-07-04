@@ -22,7 +22,7 @@ EXIT_NOT_FOUND = 5
 
 DEFAULT_CACHE_PATH = "search-token.json"
 DEFAULT_LIMIT = 1000
-DEFAULT_SEARCH_INDEX = "transcript_captions_v1"
+DEFAULT_SEARCH_INDEX = "transcript_sessions_v2"
 PROJECT_OUTPUT_FIELDS = (
     "id",
     "transcript",
@@ -123,7 +123,9 @@ def fetch_search_token(api_url: str, api_token: str) -> SearchToken:
 
     payload = response.json()
     if not isinstance(payload, dict):
-        raise CliError("/search/token returned non-object JSON", exit_code=EXIT_UPSTREAM)
+        raise CliError(
+            "/search/token returned non-object JSON", exit_code=EXIT_UPSTREAM
+        )
     return SearchToken.from_payload(payload)
 
 
@@ -241,14 +243,20 @@ def _extract_object_list(payload: Any, path: str) -> list[Mapping[str, Any]]:
     elif isinstance(payload, Mapping):
         raw_items = payload.get("items")
         if not isinstance(raw_items, list):
-            raise CliError(f"{path} returned JSON object missing array 'items'", exit_code=EXIT_UPSTREAM)
+            raise CliError(
+                f"{path} returned JSON object missing array 'items'",
+                exit_code=EXIT_UPSTREAM,
+            )
         items = raw_items
         item_location = "'items' array"
     else:
         raise CliError(f"{path} returned non-array JSON", exit_code=EXIT_UPSTREAM)
 
     if not all(isinstance(item, dict) for item in items):
-        raise CliError(f"{path} returned {item_location} containing non-object items", exit_code=EXIT_UPSTREAM)
+        raise CliError(
+            f"{path} returned {item_location} containing non-object items",
+            exit_code=EXIT_UPSTREAM,
+        )
     return items
 
 
@@ -317,13 +325,17 @@ def save_search_token(cache_path: Path, search_token: SearchToken) -> None:
 def _require_api_url(config: RuntimeConfig) -> str:
     if config.api_url and config.api_url.strip():
         return config.api_url.strip()
-    raise CliError("Missing Caption API URL. Set CAPTION_API_URL", exit_code=EXIT_CONFIG)
+    raise CliError(
+        "Missing Caption API URL. Set CAPTION_API_URL", exit_code=EXIT_CONFIG
+    )
 
 
 def _require_meili_url(config: RuntimeConfig) -> str:
     if config.meili_url and config.meili_url.strip():
         return config.meili_url.strip()
-    raise CliError("Missing Meilisearch URL. Set CAPTION_MEILI_URL", exit_code=EXIT_CONFIG)
+    raise CliError(
+        "Missing Meilisearch URL. Set CAPTION_MEILI_URL", exit_code=EXIT_CONFIG
+    )
 
 
 def resolve_meili_url(config: RuntimeConfig) -> str:
@@ -363,7 +375,10 @@ def _is_meili_auth_error(err: Exception) -> bool:
 def _require_api_token(config: RuntimeConfig) -> str:
     if config.api_token and config.api_token.strip():
         return config.api_token.strip()
-    raise CliError("Missing Clerk API key. Pass --clerk-api-key or set CLERK_API_KEY", exit_code=EXIT_CONFIG)
+    raise CliError(
+        "Missing Clerk API key. Pass --clerk-api-key or set CLERK_API_KEY",
+        exit_code=EXIT_CONFIG,
+    )
 
 
 def _require_cached_or_fresh_token(config: RuntimeConfig) -> SearchToken:
@@ -401,7 +416,9 @@ def _run_with_single_auth_retry(
         try:
             return operation(retry_client)
         except Exception as retry_exc:
-            raise CliError(_stringify_error(retry_exc), exit_code=EXIT_UPSTREAM) from retry_exc
+            raise CliError(
+                _stringify_error(retry_exc), exit_code=EXIT_UPSTREAM
+            ) from retry_exc
 
 
 def _render_table(value: Any, *, command_name: str | None = None) -> str:
