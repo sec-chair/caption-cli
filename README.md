@@ -64,15 +64,13 @@ Examples:
 
 ```bash
 uv run caption token
-uv run caption search "roadmap" --index projects_v1 --limit 10
+uv run caption search "roadmap" --index transcript_sessions_v2 --limit 10
 ```
 
 Supported search examples from help:
 
-- `transcript_captions_v1`
-- `workspace_folders_v1`
-- `projects_v1`
-- `transcript_sessions_v1`
+- `transcript_sessions_v2`
+- `transcript_blocks_v2`
 
 #### Workspace objects
 

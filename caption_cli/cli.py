@@ -73,6 +73,13 @@ ENV_VAR_DICTIONARY = {
     "AGENT_VIEWER_DATA_DIR": "overrides the agentsview data dir for sync (default: ~/.agentsview)",
 }
 
+SEARCH_INDEX_EXAMPLES = (DEFAULT_SEARCH_INDEX, "transcript_blocks_v2")
+
+
+def _search_index_examples_help() -> str:
+    examples = tuple(dict.fromkeys(SEARCH_INDEX_EXAMPLES))
+    return ", ".join(examples)
+
 
 def _tool_version() -> str:
     try:
@@ -349,8 +356,8 @@ def _add_search_arguments(parser: argparse.ArgumentParser) -> None:
         "--index",
         default=DEFAULT_SEARCH_INDEX,
         help=(
-            "Index UID (for example: transcript_captions_v1, workspace_folders_v1, "
-            "projects_v1, transcript_sessions_v1)."
+            f"Index UID (default: {DEFAULT_SEARCH_INDEX}; "
+            f"examples: {_search_index_examples_help()})."
         ),
     )
     parser.add_argument("--limit", type=int, default=DEFAULT_LIMIT, help=f"Maximum results (default: {DEFAULT_LIMIT})")
@@ -883,7 +890,7 @@ def _command_specs() -> Sequence[CommandSpec]:
                 "--limit must be >= 1.",
                 "Uses cached token and refreshes once on Meili auth failures.",
             ),
-            example="caption search \"roadmap\" --index projects_v1 --limit 10",
+            example=f"caption search \"roadmap\" --index {DEFAULT_SEARCH_INDEX} --limit 10",
         ),
         CommandSpec(
             name="list_projects",
