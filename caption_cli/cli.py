@@ -23,6 +23,7 @@ from caption_cli.commands import (
     command_rename_speaker,
     command_search,
     command_sync,
+    command_tail,
     command_token,
     dl_transcript,
 )
@@ -253,10 +254,17 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     if args.command is None:
         parser.print_help()
         raise SystemExit(EXIT_SUCCESS)
+    args.output_supplied = args.output is not None
     if args.output is None:
         args.output = command_specs[args.command].default_output
     if hasattr(args, "limit") and args.limit is not None and args.limit < 1:
         raise CliError("--limit must be >= 1")
+    if hasattr(args, "duration") and args.duration is not None and args.duration <= 0:
+        raise CliError("--duration must be > 0")
+    if hasattr(args, "max_events") and args.max_events is not None and args.max_events < 1:
+        raise CliError("--max-events must be >= 1")
+    if hasattr(args, "idle_timeout") and args.idle_timeout is not None and args.idle_timeout <= 0:
+        raise CliError("--idle-timeout must be > 0")
 
     return args
 
@@ -423,6 +431,24 @@ def _add_dl_transcript_arguments(parser: argparse.ArgumentParser) -> None:
         "--timestamp",
         action="store_true",
         help="Keep timestamps in transcript output",
+    )
+    _add_api_auth_arguments(parser)
+
+
+def _add_tail_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "transcript_id",
+        nargs="?",
+        default=None,
+        help="Transcript UUID; omitted = transcript attached to the most recently updated project",
+    )
+    parser.add_argument("--duration", type=float, default=None, help="Stop after N seconds")
+    parser.add_argument("--max-events", type=int, default=None, help="Stop after N emitted captions")
+    parser.add_argument(
+        "--idle-timeout",
+        type=float,
+        default=None,
+        help="Stop after N seconds with no emitted caption",
     )
     _add_api_auth_arguments(parser)
 
@@ -627,6 +653,16 @@ def _handle_dl_transcript(config: RuntimeConfig, args: argparse.Namespace) -> An
     return dl_transcript(config, transcript_id=args.transcript_id, timestamp=args.timestamp)
 
 
+def _handle_tail(config: RuntimeConfig, args: argparse.Namespace) -> None:
+    return command_tail(
+        config,
+        transcript_id=args.transcript_id,
+        duration=args.duration,
+        max_events=args.max_events,
+        idle_timeout=args.idle_timeout,
+    )
+
+
 def _handle_assign_speakers(config: RuntimeConfig, args: argparse.Namespace) -> dict[str, Any]:
     return command_assign_speakers(
         config,
@@ -720,7 +756,7 @@ def build_robot_docs_guide() -> str:
         "## Rules of thumb",
         "",
         "- stdout is data; stderr is diagnostics. Pipe `--output json` output straight into `jq`.",
-        "- Every read command accepts `--output json`. Per-command default formats are listed below.",
+        "- Most read commands accept `--output json`; streaming commands document their fixed stdout format.",
         "- Condensed views announce themselves on stderr; add `--full` for the raw server payload.",
         "- Start a session with `caption capabilities` (machine-readable contract, works offline).",
         "- Health-check with `caption --output json doctor --strict` (non-zero exit when a feature probe fails).",
@@ -939,6 +975,24 @@ def _command_specs() -> Sequence[CommandSpec]:
             example="caption --output json dl_transcript <transcript-uuid>",
         ),
         CommandSpec(
+            name="tail",
+            help="Stream finalized captions for one transcript",
+            add_arguments=_add_tail_arguments,
+            handler=_handle_tail,
+            default_output="plain",
+            usage="caption tail [transcript_id] [--duration SECS|--max-events N|--idle-timeout SECS]",
+            notes=(
+                "Streams finalized caption rows from the events gateway until interrupted or a bound is hit.",
+                "Stdout is fixed line format: {channel}-{index}: {content}; example: microphone-1: We should ship on Friday.",
+                "Timestamps, ids, and JSON framing are stripped by design; diagnostics go to stderr.",
+                "During reconnect/backfill, output is deduped by caption id but not guaranteed to be createdAt-ordered.",
+                "Keeps tailing the same transcript even if a new session starts.",
+                "Deleted captions are noted on stderr only.",
+                "Pass --duration, --max-events, or --idle-timeout when scripting.",
+            ),
+            example="caption tail --idle-timeout 300",
+        ),
+        CommandSpec(
             name="assign_speakers",
             help="Assign a speaker to transcript captions by channel and optional diarization index",
             add_arguments=_add_assign_speakers_arguments,
@@ -1095,6 +1149,14 @@ def run(argv: Sequence[str] | None = None) -> int:
         _require_api_url(config)
     if selected_command.needs_meili and not dry_run_requested:
         _require_meili_url(config)
+
+    if args.command == "tail":
+        if args.output_supplied:
+            raise CliError("tail has one fixed stdout line format: {channel}-{index}: {content}")
+        if args.output_file is not None:
+            raise CliError("tail streams output and cannot use --output-file")
+        selected_command.handler(config, args)
+        return 0
 
     result = selected_command.handler(config, args)
     if args.command == "doctor":

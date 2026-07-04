@@ -4,17 +4,22 @@ import json
 import os
 import re
 import sys
+import threading
+import time
 import uuid
 from typing import Any, Callable, Mapping
+from urllib.parse import urlparse
 
 import httpx
 import meilisearch
+import socketio
 
 from caption_cli import agentsview
 from caption_cli.core import (
     CliError,
     EXIT_UPSTREAM,
     RuntimeConfig,
+    _authorized_get,
     _authorized_get_json,
     _authorized_get_text,
     _authorized_request,
@@ -464,8 +469,271 @@ TRANSCRIPT_CHANNELS = {
     "loopback": 1,
     "external": 2,
 }
+_CHANNEL_NAMES = {value: name for name, value in TRANSCRIPT_CHANNELS.items()}
+_EVENTS_NAMESPACE = "/events"
 
 PROJECT_TRANSCRIPTS_PAGE_LIMIT = 100
+
+
+def _format_caption_line(caption: Mapping[str, Any]) -> str:
+    channel = caption.get("channel")
+    channel_name = _CHANNEL_NAMES.get(channel, str(channel))
+    index = caption.get("index")
+    prefix = channel_name if index is None else f"{channel_name}-{index}"
+    raw_content = caption.get("content", "")
+    content = "" if raw_content is None else " ".join(str(raw_content).split())
+    return f"{prefix}: {content}"
+
+
+def _socketio_connect_target(api_url: str) -> tuple[str, str]:
+    parsed = urlparse(api_url.strip())
+    base = f"{parsed.scheme}://{parsed.netloc}"
+    path = parsed.path.rstrip("/")
+    if not path:
+        return base, "socket.io"
+    return base, f"{path}/socket.io"
+
+
+def _fetch_events_token(api_url: str, api_token: str) -> str:
+    payload = _authorized_get(api_url, api_token, "/events")
+    token = payload.get("token")
+    if not isinstance(token, str) or not token:
+        raise CliError("/events response missing string 'token'", exit_code=EXIT_UPSTREAM)
+    return token
+
+
+def _resolve_default_transcript(api_url: str, api_token: str) -> tuple[str, Mapping[str, Any]]:
+    workspace_id = fetch_current_workspace_id(api_url, api_token)
+    projects = fetch_workspace_items(api_url, api_token, workspace_id, "projects")
+    if not projects:
+        raise CliError("No projects found in current workspace", exit_code=EXIT_UPSTREAM)
+
+    selected_project = max(
+        projects,
+        key=lambda project: project.get("updatedAt") if isinstance(project.get("updatedAt"), str) else "",
+    )
+    transcript_id = selected_project.get("transcript")
+    project_id = selected_project.get("id")
+    if not isinstance(transcript_id, str) or not transcript_id:
+        project_label = project_id if isinstance(project_id, str) and project_id else "<unknown>"
+        raise CliError(
+            f"Most recently updated project {project_label} is missing string 'transcript'",
+            exit_code=EXIT_UPSTREAM,
+        )
+    return transcript_id, selected_project
+
+
+class _EventsAuth:
+    def __init__(self, api_url: str, api_token: str, initial_token: str) -> None:
+        self.api_url = api_url
+        self.api_token = api_token
+        self.value = initial_token
+
+    def __call__(self) -> dict[str, str]:
+        try:
+            self.value = _fetch_events_token(self.api_url, self.api_token)
+        except Exception as exc:
+            print(f"note: events token refresh failed, reusing previous: {exc}", file=sys.stderr)
+        return {"token": self.value}
+
+
+def _safe_socket_disconnect(sio: Any) -> None:
+    try:
+        sio.disconnect()
+    except Exception:
+        return
+
+
+def command_tail(
+    config: RuntimeConfig,
+    *,
+    transcript_id: str | None,
+    duration: float | None,
+    max_events: int | None,
+    idle_timeout: float | None,
+    socketio_client_factory: Callable[[], Any] | None = None,
+    clock: Callable[[], float] | None = None,
+    sleep: Callable[[float], None] | None = None,
+    wait_timeout: float = 15.0,
+) -> None:
+    api_url = _require_api_url(config)
+    api_token = _require_api_token(config)
+    now = clock or time.monotonic
+    pause = sleep or time.sleep
+
+    if transcript_id is None:
+        cleaned_transcript_id, project = _resolve_default_transcript(api_url, api_token)
+        project_name = project.get("name") if isinstance(project.get("name"), str) else "<unnamed>"
+        project_id = project.get("id") if isinstance(project.get("id"), str) else "<unknown>"
+        print(
+            f"note: tailing transcript {cleaned_transcript_id} (project {project_name}, {project_id})",
+            file=sys.stderr,
+        )
+    else:
+        cleaned_transcript_id = _clean_required_id(transcript_id, "transcript_id")
+
+    initial_token = _fetch_events_token(api_url, api_token)
+    base, socketio_path = _socketio_connect_target(api_url)
+    sio = (socketio_client_factory or (lambda: socketio.Client(reconnection=True)))()
+
+    seen: set[str] = set()
+    emit_lock = threading.Lock()
+    subscribed_evt = threading.Event()
+    stop_evt = threading.Event()
+    stop_reason: list[str] = []
+    fatal_error: list[str] = []
+    emitted_count = {"value": 0}
+    last_emit_at = {"value": now()}
+    subscription_requested = {"value": False}
+
+    def _set_stop(reason: str) -> None:
+        if not stop_reason:
+            stop_reason.append(reason)
+        stop_evt.set()
+
+    def _set_fatal(message: str) -> None:
+        if not fatal_error:
+            fatal_error.append(message)
+        stop_evt.set()
+        _safe_socket_disconnect(sio)
+
+    def _emit(caption: Mapping[str, Any]) -> None:
+        caption_id = caption.get("id")
+        if caption_id is None:
+            print("note: malformed caption payload missing id", file=sys.stderr)
+            return
+        caption_key = str(caption_id)
+        with emit_lock:
+            if caption_key in seen:
+                return
+            seen.add(caption_key)
+            print(_format_caption_line(caption), flush=True)
+            emitted_count["value"] += 1
+            last_emit_at["value"] = now()
+            if max_events is not None and emitted_count["value"] >= max_events:
+                _set_stop("max-events reached")
+
+    def _emit_payload_caption(payload: Any) -> None:
+        if not isinstance(payload, Mapping):
+            print("note: malformed caption event payload: expected object", file=sys.stderr)
+            return
+        payload_transcript_id = payload.get("transcriptId")
+        if isinstance(payload_transcript_id, str) and payload_transcript_id != cleaned_transcript_id:
+            print(f"note: ignored caption event for transcript {payload_transcript_id}", file=sys.stderr)
+            return
+        caption = payload.get("caption")
+        if not isinstance(caption, Mapping):
+            print("note: malformed caption event payload missing object 'caption'", file=sys.stderr)
+            return
+        _emit(caption)
+
+    def _request_subscribe() -> None:
+        if subscription_requested["value"]:
+            return
+        subscription_requested["value"] = True
+        sio.emit(
+            "subscribe",
+            {"subjectType": "transcript", "id": cleaned_transcript_id},
+            namespace=_EVENTS_NAMESPACE,
+        )
+
+    def _on_connect(*_: Any) -> None:
+        subscribed_evt.clear()
+        subscription_requested["value"] = False
+        _request_subscribe()
+
+    def _on_ready(*_: Any) -> None:
+        if not subscription_requested["value"]:
+            subscribed_evt.clear()
+            _request_subscribe()
+
+    def _on_subscribe(payload: Any = None, *_: Any) -> None:
+        if not isinstance(payload, Mapping):
+            print("note: malformed subscribe payload: expected object", file=sys.stderr)
+            return
+        if payload.get("subjectType") == "transcript" and payload.get("id") == cleaned_transcript_id:
+            subscribed_evt.set()
+            return
+
+    def _on_modified(payload: Any = None, *_: Any) -> None:
+        _emit_payload_caption(payload)
+
+    def _on_deleted(payload: Any = None, *_: Any) -> None:
+        if isinstance(payload, Mapping):
+            caption_id = payload.get("captionId") or payload.get("id")
+            suffix = f" {caption_id}" if caption_id is not None else ""
+            print(f"note: caption deleted{suffix}", file=sys.stderr)
+            return
+        print("note: caption deleted", file=sys.stderr)
+
+    def _on_error(payload: Any = None, *_: Any) -> None:
+        _set_fatal(f"events gateway error: {payload}")
+
+    def _on_connect_error(payload: Any = None, *_: Any) -> None:
+        _set_fatal(f"events gateway connect_error: {payload}")
+
+    sio.on("connect", _on_connect, namespace=_EVENTS_NAMESPACE)
+    sio.on("ready", _on_ready, namespace=_EVENTS_NAMESPACE)
+    sio.on("subscribe", _on_subscribe, namespace=_EVENTS_NAMESPACE)
+    sio.on("event/transcript/caption/modified", _on_modified, namespace=_EVENTS_NAMESPACE)
+    sio.on("event/transcript/caption/deleted", _on_deleted, namespace=_EVENTS_NAMESPACE)
+    sio.on("error", _on_error, namespace=_EVENTS_NAMESPACE)
+    sio.on("connect_error", _on_connect_error, namespace=_EVENTS_NAMESPACE)
+
+    def _run_backfill() -> None:
+        with httpx.Client(timeout=15.0) as client:
+            captions = _fetch_paginated_object_list(
+                api_url,
+                api_token,
+                f"/transcripts/{cleaned_transcript_id}/captions",
+                client=client,
+            )
+        for caption in captions:
+            _emit(caption)
+            if stop_evt.is_set():
+                break
+
+    auth = _EventsAuth(api_url, api_token, initial_token)
+    start = now()
+    first_subscription_seen = False
+    try:
+        sio.connect(
+            base,
+            namespaces=[_EVENTS_NAMESPACE],
+            socketio_path=socketio_path,
+            transports=["websocket"],
+            auth=auth,
+            wait_timeout=wait_timeout,
+        )
+        last_emit_at["value"] = now()
+        while not stop_evt.is_set():
+            if subscribed_evt.is_set():
+                subscribed_evt.clear()
+                first_subscription_seen = True
+                _run_backfill()
+                continue
+
+            current_time = now()
+            if not first_subscription_seen and current_time - start >= wait_timeout:
+                raise CliError("Timed out waiting for events subscription acknowledgement", exit_code=EXIT_UPSTREAM)
+            if duration is not None and current_time - start >= duration:
+                _set_stop("duration reached")
+            elif idle_timeout is not None and current_time - last_emit_at["value"] >= idle_timeout:
+                _set_stop("idle-timeout reached")
+            if not stop_evt.is_set():
+                pause(0.1)
+    except KeyboardInterrupt:
+        return
+    except socketio.exceptions.ConnectionError as exc:
+        message = fatal_error[0] if fatal_error else f"Failed to connect to events gateway: {exc}"
+        raise CliError(message, exit_code=EXIT_UPSTREAM) from exc
+    finally:
+        _safe_socket_disconnect(sio)
+
+    if fatal_error:
+        raise CliError(fatal_error[0], exit_code=EXIT_UPSTREAM)
+    if stop_reason:
+        print(f"note: stopping: {stop_reason[0]}", file=sys.stderr)
 
 
 def _parse_channel(value: str) -> int:
