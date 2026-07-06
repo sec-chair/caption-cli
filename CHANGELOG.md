@@ -6,6 +6,17 @@
 
 * add `caption tail --link` for guest tailing project share links without sending `CLERK_API_KEY`
 
+## [1.0.0](https://github.com/sec-chair/caption-cli/compare/v0.3.0...v1.0.0) (2026-07-06)
+
+
+### ⚠ BREAKING CHANGES
+
+* consolidate agent docs into 'caption guide', drop share-link tests
+
+### Features
+
+* consolidate agent docs into 'caption guide', drop share-link tests ([2188f13](https://github.com/sec-chair/caption-cli/commit/2188f13467eb2fe3199a5bfcb50fec4442824a9e))
+
 ## [0.3.0](https://github.com/sec-chair/caption-cli/compare/v0.2.1...v0.3.0) (2026-07-06)
 
 
