@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Features
+
+* add `caption tail --link` for guest tailing project share links without sending `CLERK_API_KEY`
+
 ## [0.2.1](https://github.com/sec-chair/caption-cli/compare/v0.2.0...v0.2.1) (2026-07-04)
 
 

@@ -494,12 +494,82 @@ def _socketio_connect_target(api_url: str) -> tuple[str, str]:
     return base, f"{path}/socket.io"
 
 
-def _fetch_events_token(api_url: str, api_token: str) -> str:
-    payload = _authorized_get(api_url, api_token, "/events")
+def _fetch_events_token(
+    api_url: str, api_token: str | None, visa_token: str | None = None
+) -> str:
+    payload = _authorized_get(api_url, api_token, "/events", visa_token=visa_token)
     token = payload.get("token")
     if not isinstance(token, str) or not token:
         raise CliError("/events response missing string 'token'", exit_code=EXIT_UPSTREAM)
     return token
+
+
+# Matches the backend VISA_TOKEN_PATTERN for share-link slugs.
+_VISA_TOKEN_PATTERN = re.compile(r"^[A-Za-z0-9_-]{16}$")
+
+
+def _parse_share_token(value: str) -> str:
+    cleaned = value.strip()
+    if _VISA_TOKEN_PATTERN.fullmatch(cleaned):
+        return cleaned
+
+    segments = [segment for segment in urlparse(cleaned).path.split("/") if segment]
+    if "shared" in segments:
+        candidate_index = segments.index("shared") + 1
+        if candidate_index < len(segments) and _VISA_TOKEN_PATTERN.fullmatch(
+            segments[candidate_index]
+        ):
+            return segments[candidate_index]
+
+    raise CliError(
+        "--link must be a share URL like https://app.caption.fyi/shared/<token> "
+        "or a bare 16-character token"
+    )
+
+
+def _resolve_shared_transcript(
+    api_url: str, visa_token: str
+) -> tuple[str, Mapping[str, Any]]:
+    subject = _authorized_get(
+        api_url, None, f"/access/visa/{visa_token}", visa_token=visa_token
+    )
+    kind = subject.get("kind")
+    if kind == "folder":
+        raise CliError("folder share links are not supported yet")
+    if kind != "project":
+        raise CliError(
+            f"Share link resolves to unsupported subject kind: {kind!r}",
+            exit_code=EXIT_UPSTREAM,
+        )
+    project_id = subject.get("id")
+    if not isinstance(project_id, str) or not project_id:
+        raise CliError(
+            "/access/visa response missing string 'id'", exit_code=EXIT_UPSTREAM
+        )
+
+    transcripts = _fetch_paginated_object_list(
+        api_url,
+        None,
+        f"/projects/{project_id}/transcripts",
+        visa_token=visa_token,
+    )
+    if not transcripts:
+        raise CliError(
+            f"Shared project {project_id} has no transcripts", exit_code=EXIT_UPSTREAM
+        )
+    selected = max(
+        transcripts,
+        key=lambda transcript: transcript.get("updatedAt")
+        if isinstance(transcript.get("updatedAt"), str)
+        else "",
+    )
+    transcript_id = selected.get("id")
+    if not isinstance(transcript_id, str) or not transcript_id:
+        raise CliError(
+            f"Shared project {project_id} transcript is missing string 'id'",
+            exit_code=EXIT_UPSTREAM,
+        )
+    return transcript_id, {"projectId": project_id, "transcript": selected}
 
 
 def _resolve_default_transcript(api_url: str, api_token: str) -> tuple[str, Mapping[str, Any]]:
@@ -524,17 +594,29 @@ def _resolve_default_transcript(api_url: str, api_token: str) -> tuple[str, Mapp
 
 
 class _EventsAuth:
-    def __init__(self, api_url: str, api_token: str, initial_token: str) -> None:
+    def __init__(
+        self,
+        api_url: str,
+        api_token: str | None,
+        initial_token: str,
+        visa_token: str | None = None,
+    ) -> None:
         self.api_url = api_url
         self.api_token = api_token
+        self.visa_token = visa_token
         self.value = initial_token
 
     def __call__(self) -> dict[str, str]:
         try:
-            self.value = _fetch_events_token(self.api_url, self.api_token)
+            self.value = _fetch_events_token(
+                self.api_url, self.api_token, visa_token=self.visa_token
+            )
         except Exception as exc:
             print(f"note: events token refresh failed, reusing previous: {exc}", file=sys.stderr)
-        return {"token": self.value}
+        payload = {"token": self.value}
+        if self.visa_token:
+            payload["visaToken"] = self.visa_token
+        return payload
 
 
 def _safe_socket_disconnect(sio: Any) -> None:
@@ -551,17 +633,28 @@ def command_tail(
     duration: float | None,
     max_events: int | None,
     idle_timeout: float | None,
+    link: str | None = None,
     socketio_client_factory: Callable[[], Any] | None = None,
     clock: Callable[[], float] | None = None,
     sleep: Callable[[float], None] | None = None,
     wait_timeout: float = 15.0,
 ) -> None:
     api_url = _require_api_url(config)
-    api_token = _require_api_token(config)
+    visa_token = _parse_share_token(link) if link is not None else None
+    # Link mode authenticates purely as a visa guest; the Clerk key is never sent.
+    api_token = None if visa_token else _require_api_token(config)
     now = clock or time.monotonic
     pause = sleep or time.sleep
 
-    if transcript_id is None:
+    if transcript_id is not None:
+        cleaned_transcript_id = _clean_required_id(transcript_id, "transcript_id")
+    elif visa_token:
+        cleaned_transcript_id, share = _resolve_shared_transcript(api_url, visa_token)
+        print(
+            f"note: tailing shared transcript {cleaned_transcript_id} (project {share.get('projectId')})",
+            file=sys.stderr,
+        )
+    else:
         cleaned_transcript_id, project = _resolve_default_transcript(api_url, api_token)
         project_name = project.get("name") if isinstance(project.get("name"), str) else "<unnamed>"
         project_id = project.get("id") if isinstance(project.get("id"), str) else "<unknown>"
@@ -569,10 +662,8 @@ def command_tail(
             f"note: tailing transcript {cleaned_transcript_id} (project {project_name}, {project_id})",
             file=sys.stderr,
         )
-    else:
-        cleaned_transcript_id = _clean_required_id(transcript_id, "transcript_id")
 
-    initial_token = _fetch_events_token(api_url, api_token)
+    initial_token = _fetch_events_token(api_url, api_token, visa_token=visa_token)
     base, socketio_path = _socketio_connect_target(api_url)
     sio = (socketio_client_factory or (lambda: socketio.Client(reconnection=True)))()
 
@@ -687,13 +778,14 @@ def command_tail(
                 api_token,
                 f"/transcripts/{cleaned_transcript_id}/captions",
                 client=client,
+                visa_token=visa_token,
             )
         for caption in captions:
             _emit(caption)
             if stop_evt.is_set():
                 break
 
-    auth = _EventsAuth(api_url, api_token, initial_token)
+    auth = _EventsAuth(api_url, api_token, initial_token, visa_token=visa_token)
     start = now()
     first_subscription_seen = False
     try:
@@ -770,11 +862,12 @@ def _build_assign_speakers_body(
 
 def _fetch_paginated_object_list(
     api_url: str,
-    api_token: str,
+    api_token: str | None,
     path: str,
     *,
     client: httpx.Client | None = None,
     page_limit: int = PROJECT_TRANSCRIPTS_PAGE_LIMIT,
+    visa_token: str | None = None,
 ) -> list[Mapping[str, Any]]:
     items: list[Mapping[str, Any]] = []
     offset = 0
@@ -786,6 +879,7 @@ def _fetch_paginated_object_list(
             path,
             params={"offset": offset, "limit": page_limit},
             client=client,
+            visa_token=visa_token,
         )
         page_items = _extract_object_list(payload, path)
         if offset and page_items == previous_page:

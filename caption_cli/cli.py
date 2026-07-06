@@ -449,6 +449,14 @@ def _add_tail_arguments(parser: argparse.ArgumentParser) -> None:
         default=None,
         help="Transcript UUID; omitted = transcript attached to the most recently updated project",
     )
+    parser.add_argument(
+        "--link",
+        default=None,
+        help=(
+            "Share link URL or token (https://app.caption.fyi/shared/<token>); "
+            "tails the shared project as a guest, CLERK_API_KEY is not required and not sent"
+        ),
+    )
     parser.add_argument("--duration", type=float, default=None, help="Stop after N seconds")
     parser.add_argument("--max-events", type=int, default=None, help="Stop after N emitted captions")
     parser.add_argument(
@@ -667,6 +675,7 @@ def _handle_tail(config: RuntimeConfig, args: argparse.Namespace) -> None:
         duration=args.duration,
         max_events=args.max_events,
         idle_timeout=args.idle_timeout,
+        link=args.link,
     )
 
 
@@ -987,9 +996,10 @@ def _command_specs() -> Sequence[CommandSpec]:
             add_arguments=_add_tail_arguments,
             handler=_handle_tail,
             default_output="plain",
-            usage="caption tail [transcript_id] [--duration SECS|--max-events N|--idle-timeout SECS]",
+            usage="caption tail [transcript_id] [--link URL_OR_TOKEN] [--duration SECS|--max-events N|--idle-timeout SECS]",
             notes=(
                 "Streams finalized caption rows from the events gateway until interrupted or a bound is hit.",
+                "--link accepts a share URL (https://app.caption.fyi/shared/<token>) or bare token and tails the shared project as a guest; CLERK_API_KEY is not required and never sent in link mode (CAPTION_API_URL is still required).",
                 "Stdout is fixed line format: {channel}-{index}: {content}; example: microphone-1: We should ship on Friday.",
                 "Timestamps, ids, and JSON framing are stripped by design; diagnostics go to stderr.",
                 "During reconnect/backfill, output is deduped by caption id but not guaranteed to be createdAt-ordered.",

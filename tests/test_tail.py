@@ -343,9 +343,12 @@ def test_command_tail_derives_socketio_target_and_skips_default_resolution_for_e
     clients = _install_fake_socketio(monkeypatch)
     token_calls = {"count": 0}
 
-    def fake_fetch_events_token(api_url_arg: str, api_token: str) -> str:
+    def fake_fetch_events_token(
+        api_url_arg: str, api_token: str, visa_token: str | None = None
+    ) -> str:
         assert api_url_arg == api_url
         assert api_token == "api-token"
+        assert visa_token is None
         token_calls["count"] += 1
         if token_calls["count"] == 1:
             return "initial-token"
@@ -501,6 +504,282 @@ def test_run_tail_returns_zero_without_rendering_handler_result(
 
     assert cli.run(["--env-file", "", "tail", "transcript-1", "--max-events", "1"]) == 0
     assert called["value"] is True
+
+
+def test_build_auth_headers_supports_bearer_visa_and_both() -> None:
+    assert core._build_auth_headers("api-token", None) == {"Authorization": "Bearer api-token"}
+    assert core._build_auth_headers(None, "2qzfgA7_74Ph7Gsy") == {"x-caption-visa": "2qzfgA7_74Ph7Gsy"}
+    assert core._build_auth_headers("api-token", "2qzfgA7_74Ph7Gsy") == {
+        "Authorization": "Bearer api-token",
+        "x-caption-visa": "2qzfgA7_74Ph7Gsy",
+    }
+
+
+def test_build_auth_headers_requires_some_credential() -> None:
+    with pytest.raises(core.CliError) as excinfo:
+        core._build_auth_headers(None, None)
+    assert excinfo.value.exit_code == core.EXIT_CONFIG
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "2qzfgA7_74Ph7Gsy",
+        "https://app.caption.fyi/shared/2qzfgA7_74Ph7Gsy",
+        "https://app.caption.fyi/shared/2qzfgA7_74Ph7Gsy/",
+        "https://app.caption.fyi/shared/2qzfgA7_74Ph7Gsy?utm=x#frag",
+        "  2qzfgA7_74Ph7Gsy  ",
+    ],
+)
+def test_parse_share_token_accepts_urls_and_bare_tokens(value: str) -> None:
+    parse_share_token = _require_command_callable("_parse_share_token")
+    assert parse_share_token(value) == "2qzfgA7_74Ph7Gsy"
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "",
+        "not-a-token",
+        "https://app.caption.fyi/shared/",
+        "https://app.caption.fyi/shared/too-short",
+        "https://app.caption.fyi/projects/2qzfgA7_74Ph7Gsy",
+        "2qzfgA7_74Ph7Gsy-extra-characters",
+    ],
+)
+def test_parse_share_token_rejects_malformed_values(value: str) -> None:
+    parse_share_token = _require_command_callable("_parse_share_token")
+    with pytest.raises(core.CliError) as excinfo:
+        parse_share_token(value)
+    assert "--link" in excinfo.value.message
+
+
+def test_resolve_shared_transcript_uses_visa_guest_auth_and_most_recent_transcript(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    resolve_shared_transcript = _require_command_callable("_resolve_shared_transcript")
+
+    def fake_authorized_get(
+        api_url: str,
+        api_token: str | None,
+        path: str,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Mapping[str, Any]:
+        assert api_url == "https://api.example.com/api"
+        assert api_token is None
+        assert path == "/access/visa/2qzfgA7_74Ph7Gsy"
+        return {"kind": "project", "id": "project-shared"}
+
+    def fake_fetch_paginated(
+        api_url: str,
+        api_token: str | None,
+        path: str,
+        **kwargs: Any,
+    ) -> list[Mapping[str, Any]]:
+        assert api_token is None
+        assert path == "/projects/project-shared/transcripts"
+        assert kwargs.get("visa_token") == "2qzfgA7_74Ph7Gsy"
+        return [
+            {"id": "transcript-old", "updatedAt": "2026-01-01T00:00:00Z"},
+            {"id": "transcript-new", "updatedAt": "2026-07-04T00:00:00Z"},
+        ]
+
+    monkeypatch.setattr(commands, "_authorized_get", fake_authorized_get, raising=False)
+    monkeypatch.setattr(commands, "_fetch_paginated_object_list", fake_fetch_paginated, raising=False)
+
+    transcript_id, share = resolve_shared_transcript("https://api.example.com/api", "2qzfgA7_74Ph7Gsy")
+
+    assert transcript_id == "transcript-new"
+    assert share["projectId"] == "project-shared"
+
+
+@pytest.mark.parametrize(
+    ("visa_payload", "transcripts", "message"),
+    [
+        ({"kind": "folder", "id": "folder-1"}, [], "folder share links are not supported yet"),
+        ({"kind": "mystery", "id": "x"}, [], "unsupported subject kind"),
+        ({"kind": "project", "id": "project-shared"}, [], "no transcripts"),
+    ],
+)
+def test_resolve_shared_transcript_rejects_non_project_or_empty_shares(
+    monkeypatch: pytest.MonkeyPatch,
+    visa_payload: Mapping[str, Any],
+    transcripts: list[Mapping[str, Any]],
+    message: str,
+) -> None:
+    resolve_shared_transcript = _require_command_callable("_resolve_shared_transcript")
+    monkeypatch.setattr(commands, "_authorized_get", lambda *args, **kwargs: visa_payload, raising=False)
+    monkeypatch.setattr(commands, "_fetch_paginated_object_list", lambda *args, **kwargs: transcripts, raising=False)
+
+    with pytest.raises(core.CliError) as excinfo:
+        resolve_shared_transcript("https://api.example.com/api", "2qzfgA7_74Ph7Gsy")
+
+    assert message in excinfo.value.message.lower()
+
+
+def test_command_tail_with_link_never_sends_clerk_token_and_adds_visa_to_socket_auth(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    command_tail = _require_command_callable("command_tail")
+    clients = _install_fake_socketio(monkeypatch)
+
+    def fake_fetch_events_token(
+        api_url: str, api_token: str | None, visa_token: str | None = None
+    ) -> str:
+        assert api_token is None, "link mode must not send the Clerk token"
+        assert visa_token == "2qzfgA7_74Ph7Gsy"
+        return "events-token"
+
+    def fake_resolve_shared(api_url: str, visa_token: str) -> tuple[str, Mapping[str, Any]]:
+        assert visa_token == "2qzfgA7_74Ph7Gsy"
+        return "transcript-shared", {"projectId": "project-shared"}
+
+    def fail_default_resolution(*args: Any, **kwargs: Any) -> tuple[str, Mapping[str, Any]]:
+        raise AssertionError("--link must not use workspace default-transcript resolution")
+
+    def fake_fetch_captions(
+        api_url: str, api_token: str | None, path: str, **kwargs: Any
+    ) -> list[Mapping[str, Any]]:
+        assert api_token is None
+        assert kwargs.get("visa_token") == "2qzfgA7_74Ph7Gsy"
+        assert path == "/transcripts/transcript-shared/captions"
+        return [{"id": "caption-1", "channel": 0, "index": 1, "content": "Shared row"}]
+
+    monkeypatch.setattr(commands, "_fetch_events_token", fake_fetch_events_token, raising=False)
+    monkeypatch.setattr(commands, "_resolve_shared_transcript", fake_resolve_shared, raising=False)
+    monkeypatch.setattr(commands, "_resolve_default_transcript", fail_default_resolution, raising=False)
+    monkeypatch.setattr(commands, "_fetch_paginated_object_list", fake_fetch_captions, raising=False)
+
+    # api_token is set in config to prove link mode ignores it entirely.
+    test_config = core.RuntimeConfig(
+        api_url="https://api.example.com/api",
+        api_token="api-token",
+        meili_url=None,
+        cache_path=tmp_path / "search-token.json",
+        output="plain",
+    )
+
+    command_tail(
+        test_config,
+        transcript_id=None,
+        duration=0.01,
+        max_events=1,
+        idle_timeout=None,
+        link="https://app.caption.fyi/shared/2qzfgA7_74Ph7Gsy",
+    )
+
+    captured = capsys.readouterr()
+    assert captured.out == "microphone-1: Shared row\n"
+    assert "tailing shared transcript transcript-shared (project project-shared)" in captured.err
+    client = clients[0]
+    assert client.auth_payloads == [
+        {"token": "events-token", "visaToken": "2qzfgA7_74Ph7Gsy"},
+        {"token": "events-token", "visaToken": "2qzfgA7_74Ph7Gsy"},
+    ]
+    assert ("subscribe", {"subjectType": "transcript", "id": "transcript-shared"}, "/events") in client.emits
+
+
+def test_command_tail_with_link_works_without_clerk_token(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    command_tail = _require_command_callable("command_tail")
+    _install_fake_socketio(monkeypatch)
+
+    monkeypatch.setattr(
+        commands, "_fetch_events_token", lambda *args, **kwargs: "events-token", raising=False
+    )
+    monkeypatch.setattr(
+        commands,
+        "_resolve_shared_transcript",
+        lambda *args, **kwargs: ("transcript-shared", {"projectId": "project-shared"}),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        commands,
+        "_fetch_paginated_object_list",
+        lambda *args, **kwargs: [{"id": "caption-1", "channel": 0, "content": "guest row"}],
+        raising=False,
+    )
+
+    test_config = core.RuntimeConfig(
+        api_url="https://api.example.com/api",
+        api_token=None,
+        meili_url=None,
+        cache_path=tmp_path / "search-token.json",
+        output="plain",
+    )
+
+    command_tail(
+        test_config,
+        transcript_id=None,
+        duration=0.01,
+        max_events=1,
+        idle_timeout=None,
+        link="2qzfgA7_74Ph7Gsy",
+    )
+
+    assert capsys.readouterr().out == "microphone: guest row\n"
+
+
+def test_command_tail_with_link_and_explicit_transcript_skips_share_resolution(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    command_tail = _require_command_callable("command_tail")
+    clients = _install_fake_socketio(monkeypatch)
+
+    def fail_share_resolution(*args: Any, **kwargs: Any) -> tuple[str, Mapping[str, Any]]:
+        raise AssertionError("explicit transcript_id must skip shared-transcript resolution")
+
+    monkeypatch.setattr(
+        commands, "_fetch_events_token", lambda *args, **kwargs: "events-token", raising=False
+    )
+    monkeypatch.setattr(commands, "_resolve_shared_transcript", fail_share_resolution, raising=False)
+    monkeypatch.setattr(
+        commands,
+        "_fetch_paginated_object_list",
+        lambda *args, **kwargs: [{"id": "caption-1", "channel": 0, "content": "explicit row"}],
+        raising=False,
+    )
+
+    test_config = core.RuntimeConfig(
+        api_url="https://api.example.com/api",
+        api_token=None,
+        meili_url=None,
+        cache_path=tmp_path / "search-token.json",
+        output="plain",
+    )
+
+    command_tail(
+        test_config,
+        transcript_id="transcript-explicit",
+        duration=0.01,
+        max_events=1,
+        idle_timeout=None,
+        link="2qzfgA7_74Ph7Gsy",
+    )
+
+    assert capsys.readouterr().out == "microphone: explicit row\n"
+    assert (
+        "subscribe",
+        {"subjectType": "transcript", "id": "transcript-explicit"},
+        "/events",
+    ) in clients[0].emits
+
+
+def test_parse_args_for_tail_accepts_link_flag() -> None:
+    args = cli.parse_args(
+        ["--env-file", "", "tail", "--link", "https://app.caption.fyi/shared/2qzfgA7_74Ph7Gsy", "--max-events", "1"]
+    )
+    assert args.command == "tail"
+    assert args.transcript_id is None
+    assert args.link == "https://app.caption.fyi/shared/2qzfgA7_74Ph7Gsy"
 
 
 def test_capabilities_include_tail_stream_contract() -> None:
