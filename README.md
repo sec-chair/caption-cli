@@ -42,8 +42,8 @@ uv run caption --output json doctor --strict
 
 These variables are used by the main Caption commands:
 
-- `CAPTION_API_URL`: required for Caption API operations
-- `CLERK_API_KEY`: required for authenticated Caption API operations
+- `CAPTION_API_URL`: required for Caption API operations, including `tail --link`
+- `CLERK_API_KEY`: required for authenticated Caption API operations; not required or sent when `tail --link` uses a share link
 - `CAPTION_MEILI_URL`: required for `token` and `search`
 
 ### Global flags
@@ -103,6 +103,35 @@ uv run caption dl_transcript transcript-uuid --timestamp
 uv run caption --output-file transcripts/transcript-uuid.md dl_transcript transcript-uuid
 uv run caption --output json --output-file transcripts/transcript-uuid.json dl_transcript transcript-uuid
 ```
+
+#### Live caption tail
+
+- `tail [transcript_id]`: stream finalized caption rows from the events gateway
+- `tail --link URL_OR_TOKEN`: stream a shared project as a guest
+
+Examples:
+
+```bash
+uv run caption tail transcript-uuid --max-events 5
+uv run caption tail --idle-timeout 300
+uv run caption tail --link https://app.caption.fyi/shared/SHARE_TOKEN --max-events 10
+uv run caption tail transcript-uuid --link SHARE_TOKEN --duration 60
+```
+
+Output is fixed line text:
+
+```text
+microphone-1: We should ship on Friday.
+```
+
+Behavior:
+
+- without `transcript_id`, authenticated mode tails the transcript attached to the most recently updated project
+- with `--link` and no `transcript_id`, the CLI resolves the project share link and tails the most recently updated transcript in that shared project
+- `--link` accepts either `https://app.caption.fyi/shared/<token>` or the bare 16-character token
+- link mode requires `CAPTION_API_URL`, but it does not require or send `CLERK_API_KEY`
+- folder share links are not supported yet
+- stdout is reserved for caption rows; reconnect and resolution notes go to stderr
 
 #### Speakers
 

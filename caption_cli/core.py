@@ -21,6 +21,7 @@ EXIT_UPSTREAM = 4
 EXIT_NOT_FOUND = 5
 
 DEFAULT_CACHE_PATH = "search-token.json"
+VISA_TOKEN_HEADER = "x-caption-visa"
 DEFAULT_LIMIT = 1000
 DEFAULT_SEARCH_INDEX = "transcript_blocks_v2"
 PROJECT_OUTPUT_FIELDS = (
@@ -129,18 +130,35 @@ def fetch_search_token(api_url: str, api_token: str) -> SearchToken:
     return SearchToken.from_payload(payload)
 
 
+def _build_auth_headers(
+    api_token: str | None, visa_token: str | None = None
+) -> dict[str, str]:
+    headers: dict[str, str] = {}
+    if api_token:
+        headers["Authorization"] = f"Bearer {api_token}"
+    if visa_token:
+        headers[VISA_TOKEN_HEADER] = visa_token
+    if not headers:
+        raise CliError(
+            "Missing API credentials: pass --clerk-api-key/CLERK_API_KEY or a share link via --link",
+            exit_code=EXIT_CONFIG,
+        )
+    return headers
+
+
 def _authorized_request(
     api_url: str,
-    api_token: str,
+    api_token: str | None,
     method: str,
     path: str,
     params: Mapping[str, Any] | None = None,
     json_body: Mapping[str, Any] | None = None,
     expected_statuses: set[int] | None = None,
     client: httpx.Client | None = None,
+    visa_token: str | None = None,
 ) -> Mapping[str, Any]:
     url = f"{api_url.rstrip('/')}/{path.lstrip('/')}"
-    headers = {"Authorization": f"Bearer {api_token}"}
+    headers = _build_auth_headers(api_token, visa_token)
     if client is None:
         with httpx.Client(timeout=15.0) as request_client:
             response = request_client.request(
@@ -170,22 +188,26 @@ def _authorized_request(
 
 def _authorized_get(
     api_url: str,
-    api_token: str,
+    api_token: str | None,
     path: str,
     params: Mapping[str, Any] | None = None,
+    visa_token: str | None = None,
 ) -> Mapping[str, Any]:
-    return _authorized_request(api_url, api_token, "GET", path, params=params)
+    return _authorized_request(
+        api_url, api_token, "GET", path, params=params, visa_token=visa_token
+    )
 
 
 def _authorized_get_json(
     api_url: str,
-    api_token: str,
+    api_token: str | None,
     path: str,
     params: Mapping[str, Any] | None = None,
     client: httpx.Client | None = None,
+    visa_token: str | None = None,
 ) -> Any:
     url = f"{api_url.rstrip('/')}/{path.lstrip('/')}"
-    headers = {"Authorization": f"Bearer {api_token}"}
+    headers = _build_auth_headers(api_token, visa_token)
     if client is None:
         with httpx.Client(timeout=15.0) as request_client:
             response = request_client.get(url, headers=headers, params=params)

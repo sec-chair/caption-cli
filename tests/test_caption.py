@@ -2536,6 +2536,7 @@ def test_command_assign_speakers_project_mode_paginates_and_aggregates(
         path: str,
         params=None,
         client=None,
+        visa_token=None,
     ) -> dict[str, object]:
         assert path == "/projects/p1/transcripts"
         assert params["limit"] == 100
@@ -2599,6 +2600,7 @@ def test_command_assign_speakers_project_mode_reports_partial_failures(
         path: str,
         params=None,
         client=None,
+        visa_token=None,
     ) -> dict[str, object]:
         assert path == "/projects/p1/transcripts"
         return {"items": [{"id": "t1"}, {"id": "t2"}, {"id": "t3"}]}
@@ -2738,6 +2740,7 @@ def test_command_list_speakers_paginates_caption_pages_and_ignores_null_sample(
         path: str,
         params=None,
         client=None,
+        visa_token=None,
     ) -> dict[str, object]:
         assert path == "/transcripts/t1/captions"
         assert params["limit"] == 100
@@ -2779,6 +2782,7 @@ def test_fetch_paginated_object_list_rejects_non_advancing_pagination(
         path: str,
         params=None,
         client=None,
+        visa_token=None,
     ) -> dict[str, object]:
         get_offsets.append(params["offset"])
         return full_page
