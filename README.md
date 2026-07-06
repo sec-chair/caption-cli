@@ -28,13 +28,13 @@ uv run caption.py --help
 
 ### Discovery (start here if you are an agent)
 
-- `capabilities`: machine-readable CLI contract — commands, exit codes, env vars (JSON, offline)
-- `robot-docs guide`: paste-ready agent handbook (Markdown, offline)
+- `guide`: detailed agent handbook — global options, exit codes, env vars, per-command usage (Markdown, offline)
+- `--output json guide`: the same contract machine-readable (JSON, offline)
 - `doctor [--strict]`: probe which Caption features are reachable; failed probes print reasons to stderr, `--strict` exits non-zero
 
 ```bash
-uv run caption capabilities
-uv run caption robot-docs guide
+uv run caption guide
+uv run caption --output json guide
 uv run caption --output json doctor --strict
 ```
 

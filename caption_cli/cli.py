@@ -54,7 +54,7 @@ from caption_cli.core import (
 )
 
 
-CONTRACT_VERSION = "1"
+CONTRACT_VERSION = "2"
 
 EXIT_CODE_DICTIONARY = {
     str(EXIT_SUCCESS): "success (including empty results)",
@@ -71,6 +71,13 @@ ENV_VAR_DICTIONARY = {
     "CAPTION_MEILI_URL": "required for token and search",
     "ORGANIZATION_ID": "required for hosted history write/read commands",
     "AGENT_VIEWER_DATA_DIR": "overrides the agentsview data dir for sync (default: ~/.agentsview)",
+}
+
+GLOBAL_OPTION_DICTIONARY = {
+    "--env-file": "dotenv file loaded before env resolution (default: $PWD/.env)",
+    "--cache-path": "search token cache path (default: search-token.json)",
+    "--output": "output format: json, table, or md (per-command defaults vary)",
+    "--output-file": "write rendered command output to PATH",
 }
 
 SEARCH_INDEX_EXAMPLES = (DEFAULT_SEARCH_INDEX, "transcript_blocks_v2")
@@ -109,8 +116,8 @@ def _subcommand_help_epilog(spec: CommandSpec) -> str:
 def _top_level_help_epilog(specs: Sequence[CommandSpec]) -> str:
     lines = [
         "Agent quick start",
-        "  caption capabilities         machine-readable contract: commands, exit codes, env vars",
-        "  caption robot-docs guide     paste-ready agent handbook (Markdown, offline)",
+        "  caption guide                detailed agent handbook (Markdown, offline)",
+        "  caption --output json guide  machine-readable contract: commands, exit codes, env vars",
         "  caption --output json <cmd>  structured output on any read command (stdout=data, stderr=diagnostics)",
         "  caption --output json doctor --strict   health probe; non-zero exit when a feature is unavailable",
         "  --full                       raw server payloads on list_projects/list_folders/list_matters/list_md/create_md",
@@ -307,16 +314,6 @@ def _default_get_md_output_file(result: Any, args: argparse.Namespace) -> Path:
 
 def _add_no_arguments(_: argparse.ArgumentParser) -> None:
     return None
-
-
-def _add_robot_docs_arguments(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument(
-        "topic",
-        nargs="?",
-        default="guide",
-        choices=("guide",),
-        help="Documentation topic (default: guide)",
-    )
 
 
 def _add_full_flag(parser: argparse.ArgumentParser) -> None:
@@ -748,22 +745,13 @@ def build_capabilities() -> dict[str, Any]:
             }
             for spec in _command_specs()
         ],
-        "global_options": {
-            "--env-file": "dotenv file loaded before env resolution (default: $PWD/.env)",
-            "--cache-path": "search token cache path (default: search-token.json)",
-            "--output": "output format: json, table, or md (per-command defaults vary)",
-            "--output-file": "write rendered command output to PATH",
-        },
+        "global_options": dict(GLOBAL_OPTION_DICTIONARY),
         "exit_codes": EXIT_CODE_DICTIONARY,
         "env_vars": ENV_VAR_DICTIONARY,
     }
 
 
-def _handle_capabilities(_: RuntimeConfig, __: argparse.Namespace) -> dict[str, Any]:
-    return build_capabilities()
-
-
-def build_robot_docs_guide() -> str:
+def build_guide() -> str:
     lines = [
         "# caption — agent guide",
         "",
@@ -774,9 +762,17 @@ def build_robot_docs_guide() -> str:
         "- stdout is data; stderr is diagnostics. Pipe `--output json` output straight into `jq`.",
         "- Most read commands accept `--output json`; streaming commands document their fixed stdout format.",
         "- Condensed views announce themselves on stderr; add `--full` for the raw server payload.",
-        "- Start a session with `caption capabilities` (machine-readable contract, works offline).",
+        "- `caption --output json guide` prints this contract machine-readable (commands, exit codes, env vars); works offline.",
         "- Health-check with `caption --output json doctor --strict` (non-zero exit when a feature probe fails).",
         "- `sync --test` builds payloads locally and prints them without sending anything.",
+        "",
+        "## Global options",
+        "",
+        "Global flags must come before the subcommand.",
+        "",
+    ]
+    lines.extend(f"- `{flag}` — {meaning}" for flag, meaning in GLOBAL_OPTION_DICTIONARY.items())
+    lines += [
         "",
         "## Exit codes",
         "",
@@ -798,6 +794,11 @@ def build_robot_docs_guide() -> str:
         "## Commands",
     ]
     for spec in _command_specs():
+        requirements = []
+        if spec.needs_api:
+            requirements.append("Caption API (CAPTION_API_URL)")
+        if spec.needs_meili:
+            requirements.append("Meilisearch (CAPTION_MEILI_URL)")
         lines += [
             "",
             f"### {spec.name}",
@@ -807,14 +808,18 @@ def build_robot_docs_guide() -> str:
             f"- usage: `{spec.usage}`",
             f"- default output: {spec.default_output}",
         ]
+        if requirements:
+            lines.append(f"- requires: {', '.join(requirements)}")
         lines.extend(f"- {note}" for note in spec.notes)
         if spec.example:
             lines.append(f"- example: `{spec.example}`")
     return "\n".join(lines)
 
 
-def _handle_robot_docs(_: RuntimeConfig, __: argparse.Namespace) -> str:
-    return build_robot_docs_guide()
+def _handle_guide(config: RuntimeConfig, _: argparse.Namespace) -> Any:
+    if config.output == "json":
+        return build_capabilities()
+    return build_guide()
 
 
 def render_doctor_output(result: Mapping[str, Any]) -> str:
@@ -846,32 +851,19 @@ def _command_specs() -> Sequence[CommandSpec]:
             example="caption --output json doctor --strict",
         ),
         CommandSpec(
-            name="capabilities",
-            help="Print the machine-readable CLI contract (commands, exit codes, env vars)",
+            name="guide",
+            help="Print the detailed agent handbook for this CLI",
             add_arguments=_add_no_arguments,
-            handler=_handle_capabilities,
-            needs_api=False,
-            default_output="json",
-            usage="caption capabilities",
-            notes=(
-                "Generated from the same command table that drives --help; needs no network or credentials.",
-                "Includes per-command usage/notes/examples, the exit-code dictionary, and the env-var dictionary.",
-            ),
-            example="caption capabilities",
-        ),
-        CommandSpec(
-            name="robot-docs",
-            help="Print the paste-ready agent handbook for this CLI",
-            add_arguments=_add_robot_docs_arguments,
-            handler=_handle_robot_docs,
+            handler=_handle_guide,
             needs_api=False,
             default_output="md",
-            usage="caption robot-docs guide",
+            usage="caption [--output json] guide",
             notes=(
                 "Markdown handbook generated from the live command table; needs no network or credentials.",
-                "Covers output formats, exit codes, env vars, auth order, and per-command usage.",
+                "Covers global options, output formats, exit codes, env vars, auth order, and per-command usage.",
+                "caption --output json guide prints the machine-readable contract (commands, exit codes, env vars).",
             ),
-            example="caption robot-docs guide",
+            example="caption guide",
         ),
         CommandSpec(
             name="token",

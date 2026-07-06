@@ -10,7 +10,7 @@ from typing import Any, Callable, Mapping, Sequence
 import httpx
 import meilisearch
 
-# Exit-code dictionary (published via `caption capabilities` and --help):
+# Exit-code dictionary (published via `caption --output json guide` and --help):
 #   0 success · 1 user-input error · 2 usage error (argparse)
 #   3 configuration error (missing env) · 4 upstream failure · 5 remote not found
 EXIT_SUCCESS = 0

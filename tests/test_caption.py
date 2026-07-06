@@ -275,14 +275,14 @@ def test_run_doctor_json_output_is_structured_and_parseable(
     assert captured.err == ""
 
 
-def test_run_capabilities_emits_machine_readable_contract_offline(
+def test_run_guide_json_emits_machine_readable_contract_offline(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     for env_var in ("CAPTION_API_URL", "CLERK_API_KEY", "CAPTION_MEILI_URL", "ORGANIZATION_ID"):
         monkeypatch.delenv(env_var, raising=False)
 
-    exit_code = cli.run(["--env-file", "", "capabilities"])
+    exit_code = cli.run(["--env-file", "", "--output", "json", "guide"])
 
     captured = capsys.readouterr()
     assert exit_code == 0
@@ -290,7 +290,7 @@ def test_run_capabilities_emits_machine_readable_contract_offline(
     assert payload["tool"] == "caption"
     assert payload["contract_version"]
     command_names = [command["name"] for command in payload["commands"]]
-    assert "capabilities" in command_names
+    assert "guide" in command_names
     assert "doctor" in command_names
     assert "search" in command_names
     assert payload["exit_codes"]["0"]
@@ -302,8 +302,8 @@ def test_run_capabilities_emits_machine_readable_contract_offline(
     assert search_command["default_output"] == "table"
 
 
-def test_capabilities_defaults_to_json_output() -> None:
-    assert cli.parse_args(["capabilities"]).output == "json"
+def test_guide_defaults_to_md_output() -> None:
+    assert cli.parse_args(["guide"]).output == "md"
 
 
 def test_list_projects_full_returns_raw_payload_without_note(
@@ -840,28 +840,31 @@ def test_bare_invocation_prints_cheat_sheet_help_and_exits_zero(
     assert "Agent quick start" in output
 
 
-def test_run_robot_docs_guide_prints_agent_handbook_offline(
+def test_run_guide_prints_agent_handbook_offline(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     for env_var in ("CAPTION_API_URL", "CLERK_API_KEY", "CAPTION_MEILI_URL", "ORGANIZATION_ID"):
         monkeypatch.delenv(env_var, raising=False)
 
-    exit_code = cli.run(["--env-file", "", "robot-docs", "guide"])
+    exit_code = cli.run(["--env-file", "", "guide"])
 
     output = capsys.readouterr().out
     assert exit_code == 0
     assert "# caption — agent guide" in output
+    assert "## Global options" in output
     assert "## Exit codes" in output
     assert "## Environment" in output
     assert "### search" in output
-    assert "caption capabilities" in output
+    assert "- requires: Caption API (CAPTION_API_URL), Meilisearch (CAPTION_MEILI_URL)" in output
+    assert "caption --output json guide" in output
 
 
-def test_robot_docs_topic_defaults_to_guide() -> None:
-    args = cli.parse_args(["robot-docs"])
-    assert args.topic == "guide"
-    assert args.output == "md"
+def test_removed_doc_commands_error_as_usage() -> None:
+    for legacy in (["capabilities"], ["robot-docs", "guide"]):
+        with pytest.raises(SystemExit) as excinfo:
+            cli.parse_args(legacy)
+        assert excinfo.value.code == core.EXIT_USAGE
 
 
 def test_subcommand_help_includes_notes_example_and_default_output(
@@ -885,7 +888,7 @@ def test_top_level_help_has_agent_quick_start(capsys: pytest.CaptureFixture[str]
 
     output = capsys.readouterr().out
     assert "Agent quick start" in output
-    assert "caption capabilities" in output
+    assert "caption guide" in output
     assert "--output json" in output
 
 
@@ -2882,6 +2885,6 @@ def test_run_assign_speakers_dry_run_is_offline(
     }
 
 
-def test_capabilities_includes_speaker_commands() -> None:
+def test_guide_contract_includes_speaker_commands() -> None:
     command_names = {command["name"] for command in cli.build_capabilities()["commands"]}
     assert {"assign_speakers", "list_speakers", "rename_speaker"} <= command_names

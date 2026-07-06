@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # audit/regression_tests/R-002__exit_code_dictionary.test.sh
 # Pins: the exit-code dictionary — 3 for missing config, 2 for usage errors,
-#       and the dictionary published in --help and capabilities.
+#       and the dictionary published in --help and the guide json contract.
 # Applied in Pass 2. Runs fully offline.
 set -uo pipefail
 cd "$(dirname "$0")/../../.."
@@ -24,9 +24,9 @@ run_caption list_md >/dev/null 2>&1
 run_caption not_a_command >/dev/null 2>&1
 [ $? -eq 2 ] || fail "unknown command no longer exits 2 (R-002)"
 
-# 3. Dictionary is published in --help and capabilities.
+# 3. Dictionary is published in --help and the guide json contract.
 run_caption --help 2>/dev/null | grep -q "Exit codes" || fail "--help lost the 'Exit codes' section (R-002)"
-run_caption capabilities 2>/dev/null | jq -e '.exit_codes | has("3") and has("4") and has("5")' >/dev/null \
-  || fail "capabilities lost the full exit-code dictionary (R-002)"
+run_caption --output json guide 2>/dev/null | jq -e '.exit_codes | has("3") and has("4") and has("5")' >/dev/null \
+  || fail "guide json contract lost the full exit-code dictionary (R-002)"
 
 echo "OK"
