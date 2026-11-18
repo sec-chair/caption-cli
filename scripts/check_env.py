@@ -64,7 +64,7 @@ def render_value(spec: EnvVarSpec, value: str) -> str:
 def main() -> int:
     from dotenv import load_dotenv
 
-    env_file = Path(__file__).resolve().parent / ".env"
+    env_file = Path(__file__).resolve().parent.parent / ".env"
     load_dotenv(dotenv_path=env_file, override=False)
 
     missing_required: list[str] = []

@@ -1,30 +1,19 @@
 # caption-cli
 
-This repo has one CLI entrypoint and one agentsview support module. Treating them as separate tools matters:
-
-- [`caption.py`](/Users/alin/code/caption/caption-cli/caption.py) is the executable entrypoint.
-- [`caption_cli/agentsview.py`](/Users/alin/code/caption/caption-cli/caption_cli/agentsview.py) is not a standalone script. It powers the `sync` subcommand exposed through `caption.py`.
-
 ## Setup
 
 Use `uv`. Anything else is the wrong tool for this repo.
 
 ```bash
 uv sync
+uv run caption --help
 ```
 
 By default the CLI loads environment variables from `$PWD/.env`. Override that with `--env-file` if needed.
 
-## `caption.py`
+## Usage
 
-Run either form:
-
-```bash
-uv run caption --help
-uv run caption.py --help
-```
-
-`caption.py` is a thin wrapper that calls [`caption_cli.main:main`](/Users/alin/code/caption/caption-cli/caption_cli/main.py). The actual command registration lives in [`caption_cli/cli.py`](/Users/alin/code/caption/caption-cli/caption_cli/cli.py), and the API/Meilisearch behavior lives in [`caption_cli/commands.py`](/Users/alin/code/caption/caption-cli/caption_cli/commands.py) and [`caption_cli/core.py`](/Users/alin/code/caption/caption-cli/caption_cli/core.py).
+The `caption` console script calls [`caption_cli.main:main`](caption_cli/main.py). Command registration lives in [`caption_cli/cli.py`](caption_cli/cli.py); API/Meilisearch behavior lives in [`caption_cli/commands.py`](caption_cli/commands.py) and [`caption_cli/core.py`](caption_cli/core.py).
 
 ### Discovery (start here if you are an agent)
 
@@ -159,116 +148,7 @@ uv run caption rename_speaker project-uuid speaker-uuid --name "Alice Smith"
 
 `list_speakers` shows speaker IDs only — caption payloads do not include speaker names. `rename_speaker` only works on custom speakers; user-backed speakers are rejected by the API.
 
-#### Hosted Markdown documents
-
-These commands use `https://history.caption.fyi`, like `sync`, and do not require `CAPTION_API_URL` or `CAPTION_MEILI_URL`.
-
-- `list_matters`
-- `create_md <markdown_file>`
-- `list_md`
-- `get_md <id>`
-
-Examples:
-
-```bash
-uv run caption list_matters --include-one-shot
-uv run caption create_md README.md --project-name "caption-cli endpoint probe" --title "CLI README"
-uv run caption list_md --limit 50 --sort recent
-uv run caption get_md markdown-document-uuid
-uv run caption --output-file docs/markdown-document-uuid.md get_md markdown-document-uuid
-```
-
-Flags:
-
-- `list_matters`: `--include-one-shot`, `--clerk-api-key`, `--org-id`
-- `create_md`: `--project-id`, `--project-name`, `--title`, `--clerk-api-key`, `--org-id`; `--title` defaults to the filename, and output truncates `raw_markdown` and `plain_text` to 100 characters
-- `list_md`: `--project`, `--exclude-project`, `--tag`, `--created-by`, `--sort`, `--cursor`, `--limit`, `--clerk-api-key`, `--org-id`
-- `get_md`: `--cache-dir`, `--clerk-api-key`, `--org-id`; saves `raw_markdown` to `caption_cache/md/<title>.md` by default instead of printing the full API response
-
-## `caption_cli/agentsview.py`
-
-This module handles exporting and publishing agentsview session data from a local SQLite database. You do not run this file directly. You use it through:
-
-- `uv run caption sync ...`
-
-### What it does
-
-- resolves the default data directory from `AGENT_VIEWER_DATA_DIR` or `~/.agentsview`
-- reads the local `sessions.db`
-- snapshots the SQLite database into memory before querying it
-- selects sessions by case-insensitive partial match on the raw session ID
-- reconstructs messages, tool calls, and tool result events
-- builds share payloads
-- either prints the payload JSON or sends payloads to a share server
-
-### Defaults
-
-- default DB path: `~/.agentsview/sessions.db`
-
-If `AGENT_VIEWER_DATA_DIR` is set, the default DB path moves under that directory.
-
-### `sync`
-
-Build share payloads from the local SQLite database and either print them or send them.
-
-```bash
-uv run caption sync --session-id s1 --test
-uv run caption sync --session-id s1 --org-id org_123
-uv run caption sync --session-id s1 --project-name "Matter Override" --org-id org_123
-uv run caption sync --session-id '*' --org-id org_123
-```
-
-Flags:
-
-- `--db-path`
-- `--session-id`
-- `--project-name`
-- `--test`
-- `--clerk-api-key`
-- `--org-id`
-
-Behavior:
-
-- `--session-id` is required
-- matching is case-insensitive substring match against `sessions.id`
-- `--session-id '*'` selects all non-deleted sessions
-- `--project-name` overrides the built payload's `session.project` for every matched session
-- `--test` prints the built JSON payloads and does not require send auth
-- without `--test`, the command sends payloads to `https://history.caption.fyi` over a single reused HTTP connection
-- if any session fails to send, the command exits `4` (upstream failure) and the error message embeds the full sent/failures report
-
-This command does not require `CAPTION_API_URL` or `CAPTION_MEILI_URL`.
-
-Auth resolution:
-
-1. CLI flag
-2. environment variable from `.env` or the shell
-3. failure with `CliError` if a required send setting is still missing
-
-Relevant auth variables:
-
-```dotenv
-CLERK_API_KEY=token
-ORGANIZATION_ID=org_123
-```
-
-`sync` always sends to `https://history.caption.fyi` unless `--test` is used.
-
-### Share payload shape
-
-Each built payload includes:
-
-- `share_id`
-- `session`
-- `messages`
-
-`share_id` is built as:
-
-```text
-{session_id}
-```
-
-### Development
+## Development
 
 Run tests with:
 

@@ -2,3 +2,9 @@
 *.pyc
 /.DS_Store
 /search-token.json
+__pycache__/
+/.pytest_cache/
+/.ruff_cache/
+/.uv-cache/
+/.venv/
+/caption_cache/

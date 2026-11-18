@@ -3,10 +3,11 @@ from __future__ import annotations
 import argparse
 import difflib
 import importlib.metadata
+import inspect
 import os
 import sys
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 from dotenv import load_dotenv
 
@@ -22,17 +23,9 @@ from caption_cli.commands import (
     command_list_speakers,
     command_rename_speaker,
     command_search,
-    command_sync,
     command_tail,
     command_token,
     dl_transcript,
-)
-from caption_cli.agentsview import (
-    command_create_md,
-    command_get_md,
-    command_list_matters,
-    command_list_md,
-    default_db_path,
 )
 from caption_cli.core import (
     CliError,
@@ -54,23 +47,21 @@ from caption_cli.core import (
 )
 
 
-CONTRACT_VERSION = "2"
+CONTRACT_VERSION = "3"
 
 EXIT_CODE_DICTIONARY = {
     str(EXIT_SUCCESS): "success (including empty results)",
     str(EXIT_USER_INPUT): "user-input error (bad value, bad local file path, conflicting flags); also doctor --strict probe failure",
     str(EXIT_USAGE): "usage error (argparse: unknown command, unknown flag, missing argument)",
-    str(EXIT_CONFIG): "configuration error (missing CAPTION_API_URL, CLERK_API_KEY, CAPTION_MEILI_URL, or ORGANIZATION_ID)",
+    str(EXIT_CONFIG): "configuration error (missing CAPTION_API_URL, CLERK_API_KEY, or CAPTION_MEILI_URL)",
     str(EXIT_UPSTREAM): "upstream failure (HTTP error, Meilisearch error, malformed server response)",
     str(EXIT_NOT_FOUND): "remote resource not found (HTTP 404)",
 }
 
 ENV_VAR_DICTIONARY = {
     "CAPTION_API_URL": "required for Caption API commands",
-    "CLERK_API_KEY": "required for authenticated Caption API and hosted history calls",
+    "CLERK_API_KEY": "required for authenticated Caption API calls",
     "CAPTION_MEILI_URL": "required for token and search",
-    "ORGANIZATION_ID": "required for hosted history write/read commands",
-    "AGENT_VIEWER_DATA_DIR": "overrides the agentsview data dir for sync (default: ~/.agentsview)",
 }
 
 GLOBAL_OPTION_DICTIONARY = {
@@ -81,6 +72,12 @@ GLOBAL_OPTION_DICTIONARY = {
 }
 
 SEARCH_INDEX_EXAMPLES = (DEFAULT_SEARCH_INDEX, "transcript_blocks_v2")
+
+# Commands whose output handling differs from the standard render/emit path.
+_COMMAND_DOCTOR = "doctor"
+_COMMAND_TAIL = "tail"
+
+_Handler = Callable[[RuntimeConfig, argparse.Namespace], Any]
 
 
 def _search_index_examples_help() -> str:
@@ -93,10 +90,6 @@ def _tool_version() -> str:
         return importlib.metadata.version("caption-cli")
     except importlib.metadata.PackageNotFoundError:
         return "unknown"
-
-
-def default_download_cache_dir() -> Path:
-    return Path("caption_cache")
 
 
 def default_env_file() -> Path:
@@ -113,6 +106,21 @@ def _subcommand_help_epilog(spec: CommandSpec) -> str:
     return "\n".join(lines)
 
 
+def _aligned_rows(rows: Mapping[str, str]) -> list[str]:
+    # Two-column help rows padded to the longest key, e.g. "  KEY    meaning".
+    width = max(len(key) for key in rows)
+    return [f"  {key.ljust(width)}  {meaning}" for key, meaning in rows.items()]
+
+
+def _default_outputs_help(specs: Sequence[CommandSpec]) -> str:
+    # Group commands by default --output, e.g. "table: search, list_projects".
+    groups: dict[str, list[str]] = {}
+    for spec in specs:
+        groups.setdefault(spec.default_output, []).append(spec.name)
+
+    return "; ".join(f"{fmt}: {', '.join(names)}" for fmt, names in groups.items())
+
+
 def _top_level_help_epilog(specs: Sequence[CommandSpec]) -> str:
     lines = [
         "Agent quick start",
@@ -120,27 +128,17 @@ def _top_level_help_epilog(specs: Sequence[CommandSpec]) -> str:
         "  caption --output json guide  machine-readable contract: commands, exit codes, env vars",
         "  caption --output json <cmd>  structured output on any read command (stdout=data, stderr=diagnostics)",
         "  caption --output json doctor --strict   health probe; non-zero exit when a feature is unavailable",
-        "  --full                       raw server payloads on list_projects/list_folders/list_matters/list_md/create_md",
+        "  --full                       raw server payloads on list_projects/list_folders",
         "",
         "Environment",
-        "  CAPTION_API_URL   required for Caption API commands",
-        "  CLERK_API_KEY     required for authenticated Caption API calls",
-        "  CAPTION_MEILI_URL required for token and search",
-        "  ORGANIZATION_ID   required for hosted history write/read commands",
-        "  AGENT_VIEWER_DATA_DIR overrides the agentsview data dir for sync (default: ~/.agentsview)",
-        "",
-        "Global options",
-        "  --env-file ENV_FILE      dotenv file loaded before env resolution (default: $PWD/.env)",
-        "  --cache-path CACHE_PATH  search token cache path (default: search-token.json)",
-        (
-            "  --output {json,table,md} output format "
-            "(default: json, except search/list_projects/list_folders/list_matters/list_speakers=table "
-            "and dl_transcript/get_md=md)"
-        ),
-        "  --output-file PATH      write rendered output to PATH for large outputs like list_projects, list_folders, list_matters, dl_transcript, get_md",
-        "",
-        "Exit codes",
     ]
+
+    # Env vars and global options come from the shared dictionaries so help, guide, and JSON agree.
+    lines.extend(_aligned_rows(ENV_VAR_DICTIONARY))
+    lines += ["", "Global options"]
+    lines.extend(_aligned_rows(GLOBAL_OPTION_DICTIONARY))
+    lines.append(f"  default --output per command: {_default_outputs_help(specs)}")
+    lines += ["", "Exit codes"]
     lines.extend(f"  {code}  {meaning}" for code, meaning in EXIT_CODE_DICTIONARY.items())
     lines += [
         "",
@@ -165,7 +163,7 @@ def _top_level_help_epilog(specs: Sequence[CommandSpec]) -> str:
 def build_parser(
     env_file: Path,
 ) -> tuple[argparse.ArgumentParser, dict[str, CommandSpec], dict[str, argparse.ArgumentParser]]:
-    specs = tuple(_command_specs())
+    specs = _COMMAND_SPECS
     parser = argparse.ArgumentParser(
         prog="caption",
         description="Caption CLI for API and Meilisearch operations.",
@@ -289,29 +287,6 @@ def write_output_file(path: Path, rendered: str, command: str) -> str:
     return f"Saved {command} output to {path}"
 
 
-def _safe_filename(value: str) -> str:
-    filename = "".join(char if char.isalnum() or char in "._-" else "_" for char in value.strip())
-    return filename or "document"
-
-
-def _strip_markdown_suffix(value: str) -> str:
-    stem = value.strip()
-    while stem.lower().endswith(".md"):
-        stem = stem[:-3].rstrip()
-    return stem
-
-
-def _get_md_output_filename(result: Any, args: argparse.Namespace) -> str:
-    title = result.get("title") if isinstance(result, dict) else None
-    if not isinstance(title, str) or not title.strip():
-        title = args.id
-    return f"{_safe_filename(_strip_markdown_suffix(title))}.md"
-
-
-def _default_get_md_output_file(result: Any, args: argparse.Namespace) -> Path:
-    return Path(args.cache_dir).expanduser() / "md" / _get_md_output_filename(result, args)
-
-
 def _add_no_arguments(_: argparse.ArgumentParser) -> None:
     return None
 
@@ -330,7 +305,7 @@ def _add_list_workspace_arguments(parser: argparse.ArgumentParser) -> None:
 
 
 def _add_doctor_arguments(parser: argparse.ArgumentParser) -> None:
-    _add_history_auth_arguments(parser)
+    _add_api_auth_arguments(parser)
     parser.add_argument(
         "--strict",
         action="store_true",
@@ -506,27 +481,6 @@ def _add_rename_speaker_arguments(parser: argparse.ArgumentParser) -> None:
     _add_dry_run_flag(parser)
 
 
-def _add_sync_arguments(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--db-path", default=str(default_db_path()), help="SQLite sessions database path")
-    parser.add_argument("--session-id", required=True, help="Case-insensitive session ID substring, or * for all")
-    parser.add_argument("--project-name", default=None, help="Override the destination project display name")
-    parser.add_argument(
-        "--test",
-        "--dry-run",
-        dest="test",
-        action="store_true",
-        help="Build payloads locally and print JSON without sending (--dry-run is an alias)",
-    )
-    parser.add_argument("--yes", action="store_true", help="Confirm bulk sends (required for --session-id '*')")
-    parser.add_argument("--clerk-api-key", default=None, help="Bearer token override for share requests")
-    parser.add_argument("--org-id", default=None, help="Organization header override for share requests")
-
-
-def _add_history_auth_arguments(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--clerk-api-key", default=None, help="Bearer token override for history requests")
-    parser.add_argument("--org-id", default=None, help="Organization header override for history requests")
-
-
 def _add_dry_run_flag(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--dry-run",
@@ -543,188 +497,17 @@ def _add_api_auth_arguments(parser: argparse.ArgumentParser) -> None:
     )
 
 
-def _add_create_md_arguments(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("markdown_file", help="Markdown file to submit")
-    parser.add_argument("--project-id", default=None, help="Destination project UUID")
-    parser.add_argument("--project-name", default=None, help="Destination project display-name search")
-    parser.add_argument("--title", default=None, help="Document title; defaults to the Markdown filename")
-    _add_full_flag(parser)
-    _add_dry_run_flag(parser)
-    _add_history_auth_arguments(parser)
+def _bind(command: Callable[..., Any]) -> _Handler:
+    # Generic handler: pass parsed args matching the command's parameter names
+    # as keywords, e.g. args.full -> command_list_projects(config, full=...).
+    # Resolves the command by name at call time so monkeypatching cli.<name> works.
+    def handler(config: RuntimeConfig, args: argparse.Namespace) -> Any:
+        resolved = globals()[command.__name__]
+        parsed = vars(args)
+        names = list(inspect.signature(resolved).parameters)[1:]
+        return resolved(config, **{name: parsed[name] for name in names if name in parsed})
 
-
-def _add_list_md_arguments(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--project", default=None, help="Project display name filter")
-    parser.add_argument("--exclude-project", dest="exclude_project", default=None, help="Project display name exclusion")
-    parser.add_argument("--tag", action="append", default=None, help="Tag filter; repeat or pass comma-separated values")
-    parser.add_argument(
-        "--created-by",
-        dest="created_by",
-        action="append",
-        default=None,
-        help="Clerk user id filter; repeat or pass comma-separated values",
-    )
-    parser.add_argument("--sort", choices=("recent", "most_starred"), default=None, help="Sort order")
-    parser.add_argument("--cursor", default=None, help="Pagination cursor")
-    parser.add_argument("--limit", type=int, default=None, help="Page size, max 500")
-    _add_full_flag(parser)
-    _add_history_auth_arguments(parser)
-
-
-def _add_list_matters_arguments(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument(
-        "--include-one-shot",
-        action="store_true",
-        help="Include one-shot projects by sending include_one_shot=true",
-    )
-    _add_full_flag(parser)
-    _add_history_auth_arguments(parser)
-
-
-def _add_get_md_arguments(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("id", help="Markdown document UUID")
-    parser.add_argument(
-        "--cache-dir",
-        type=Path,
-        default=default_download_cache_dir(),
-        help="Directory for cached get_md Markdown files (default: caption_cache)",
-    )
-    _add_history_auth_arguments(parser)
-
-
-def _handle_token(config: RuntimeConfig, args: argparse.Namespace) -> dict[str, Any]:
-    return command_token(config, show_token=args.show_token)
-
-
-def _handle_search(config: RuntimeConfig, args: argparse.Namespace) -> dict[str, Any]:
-    return command_search(
-        config,
-        query=args.query,
-        index=args.index,
-        limit=args.limit,
-        show_dupes=args.show_dupes,
-    )
-
-
-def _handle_list_projects(config: RuntimeConfig, args: argparse.Namespace) -> dict[str, Any]:
-    return command_list_projects(config, full=args.full)
-
-
-def _handle_list_folders(config: RuntimeConfig, args: argparse.Namespace) -> dict[str, Any]:
-    return command_list_folders(config, full=args.full)
-
-
-def _handle_create_project(config: RuntimeConfig, args: argparse.Namespace) -> dict[str, Any]:
-    return command_create_project(
-        config,
-        name=args.name,
-        description=args.description,
-        workspace_id=args.workspace_id,
-        dry_run=args.dry_run,
-    )
-
-
-def _handle_create_folder(config: RuntimeConfig, args: argparse.Namespace) -> dict[str, Any]:
-    return command_create_folder(
-        config,
-        name=args.name,
-        description=args.description,
-        parent=args.parent,
-        workspace_id=args.workspace_id,
-        dry_run=args.dry_run,
-    )
-
-
-def _handle_edit_project(config: RuntimeConfig, args: argparse.Namespace) -> dict[str, Any]:
-    return command_edit_project(
-        config,
-        project_id=args.project_id,
-        name=args.name,
-        description=args.description,
-        clear_description=args.clear_description,
-        folder=args.folder,
-        clear_folder=args.clear_folder,
-        dry_run=args.dry_run,
-    )
-
-
-def _handle_edit_folder(config: RuntimeConfig, args: argparse.Namespace) -> dict[str, Any]:
-    return command_edit_folder(
-        config,
-        folder_id=args.folder_id,
-        name=args.name,
-        description=args.description,
-        clear_description=args.clear_description,
-        parent=args.parent,
-        clear_parent=args.clear_parent,
-        dry_run=args.dry_run,
-    )
-
-
-def _handle_dl_transcript(config: RuntimeConfig, args: argparse.Namespace) -> Any:
-    return dl_transcript(config, transcript_id=args.transcript_id, timestamp=args.timestamp)
-
-
-def _handle_tail(config: RuntimeConfig, args: argparse.Namespace) -> None:
-    return command_tail(
-        config,
-        transcript_id=args.transcript_id,
-        duration=args.duration,
-        max_events=args.max_events,
-        idle_timeout=args.idle_timeout,
-        link=args.link,
-    )
-
-
-def _handle_assign_speakers(config: RuntimeConfig, args: argparse.Namespace) -> dict[str, Any]:
-    return command_assign_speakers(
-        config,
-        transcript_id=args.transcript_id,
-        project_id=args.project_id,
-        channel=args.channel,
-        index=args.index,
-        speaker_id=args.speaker_id,
-        name=args.name,
-        dry_run=args.dry_run,
-    )
-
-
-def _handle_list_speakers(config: RuntimeConfig, args: argparse.Namespace) -> dict[str, Any]:
-    return command_list_speakers(config, transcript_id=args.transcript_id)
-
-
-def _handle_rename_speaker(config: RuntimeConfig, args: argparse.Namespace) -> dict[str, Any]:
-    return command_rename_speaker(
-        config,
-        project_id=args.project_id,
-        speaker_id=args.speaker_id,
-        name=args.name,
-        dry_run=args.dry_run,
-    )
-
-
-def _handle_sync(config: RuntimeConfig, args: argparse.Namespace) -> Any:
-    return command_sync(config, args)
-
-
-def _handle_create_md(config: RuntimeConfig, args: argparse.Namespace) -> Any:
-    return command_create_md(config, args)
-
-
-def _handle_list_md(config: RuntimeConfig, args: argparse.Namespace) -> Any:
-    return command_list_md(config, args)
-
-
-def _handle_list_matters(config: RuntimeConfig, args: argparse.Namespace) -> Any:
-    return command_list_matters(config, args)
-
-
-def _handle_get_md(config: RuntimeConfig, args: argparse.Namespace) -> Any:
-    return command_get_md(config, args)
-
-
-def _handle_doctor(config: RuntimeConfig, args: argparse.Namespace) -> Any:
-    return command_doctor(config, args)
+    return handler
 
 
 def build_capabilities() -> dict[str, Any]:
@@ -743,7 +526,7 @@ def build_capabilities() -> dict[str, Any]:
                 "needs_api": spec.needs_api,
                 "needs_meili": spec.needs_meili,
             }
-            for spec in _command_specs()
+            for spec in _COMMAND_SPECS
         ],
         "global_options": dict(GLOBAL_OPTION_DICTIONARY),
         "exit_codes": EXIT_CODE_DICTIONARY,
@@ -755,7 +538,7 @@ def build_guide() -> str:
     lines = [
         "# caption — agent guide",
         "",
-        "caption drives the Caption API, Meilisearch search, and the hosted history (agentsview) server.",
+        "caption drives the Caption API and Meilisearch search.",
         "",
         "## Rules of thumb",
         "",
@@ -764,7 +547,6 @@ def build_guide() -> str:
         "- Condensed views announce themselves on stderr; add `--full` for the raw server payload.",
         "- `caption --output json guide` prints this contract machine-readable (commands, exit codes, env vars); works offline.",
         "- Health-check with `caption --output json doctor --strict` (non-zero exit when a feature probe fails).",
-        "- `sync --test` builds payloads locally and prints them without sending anything.",
         "",
         "## Global options",
         "",
@@ -789,11 +571,10 @@ def build_guide() -> str:
         "## Authentication",
         "",
         "- Every authenticated command accepts `--clerk-api-key`, falling back to `CLERK_API_KEY` (a `.env` in $PWD is loaded automatically; override with `--env-file`).",
-        "- Hosted history commands (sync, create_md, list_md, get_md, list_matters, doctor) accept `--clerk-api-key` and `--org-id` flags, falling back to `CLERK_API_KEY` / `ORGANIZATION_ID`.",
         "",
         "## Commands",
     ]
-    for spec in _command_specs():
+    for spec in _COMMAND_SPECS:
         requirements = []
         if spec.needs_api:
             requirements.append("Caption API (CAPTION_API_URL)")
@@ -823,30 +604,25 @@ def _handle_guide(config: RuntimeConfig, _: argparse.Namespace) -> Any:
 
 
 def render_doctor_output(result: Mapping[str, Any]) -> str:
-    organization = result.get("organization")
-    features = result.get("features") or ()
-    lines = [
-        f"ORGANIZATION: {organization if organization is not None else 'None'}",
-        "CAPTION FEATURES AVAILABLE:",
-    ]
-    lines.extend(feature for feature in ("core", "agentsview") if feature in features)
-    return "\n".join(lines)
+    # Available features are the names of passing probes.
+    features = [probe["name"] for probe in result.get("probes") or () if probe["available"]]
+    return "\n".join(["CAPTION FEATURES AVAILABLE:", *features])
 
 
 def _command_specs() -> Sequence[CommandSpec]:
     return (
         CommandSpec(
-            name="doctor",
+            name=_COMMAND_DOCTOR,
             help="Probe available Caption features",
             add_arguments=_add_doctor_arguments,
-            handler=_handle_doctor,
+            handler=_bind(command_doctor),
             needs_api=False,
             default_output="plain",
-            usage="caption doctor [--strict] [--clerk-api-key TOKEN] [--org-id ORG]",
+            usage="caption doctor [--strict] [--clerk-api-key TOKEN]",
             notes=(
-                "Probes Caption API core support and hosted history Markdown support.",
+                "Probes Caption API core support.",
                 "Failed probes print their reason to stderr; pass --strict to also exit non-zero.",
-                "Use --output json for the full structured result: {organization, features, probes}.",
+                "Use --output json for the full structured result: {probes: [{name, available, reason}]}.",
             ),
             example="caption --output json doctor --strict",
         ),
@@ -869,7 +645,7 @@ def _command_specs() -> Sequence[CommandSpec]:
             name="token",
             help="Fetch and cache /search/token credentials",
             add_arguments=_add_token_arguments,
-            handler=_handle_token,
+            handler=_bind(command_token),
             needs_meili=True,
             usage="caption token [--show-token]",
             notes=(
@@ -883,7 +659,7 @@ def _command_specs() -> Sequence[CommandSpec]:
             name="search",
             help="Search one Meilisearch index",
             add_arguments=_add_search_arguments,
-            handler=_handle_search,
+            handler=_bind(command_search),
             needs_meili=True,
             default_output="table",
             usage="caption search <query> [--index INDEX] [--limit N] [--show-dupes]",
@@ -897,7 +673,7 @@ def _command_specs() -> Sequence[CommandSpec]:
             name="list_projects",
             help="List all projects in the current user's workspace",
             add_arguments=_add_list_workspace_arguments,
-            handler=_handle_list_projects,
+            handler=_bind(command_list_projects),
             default_output="table",
             usage="caption list_projects [--full]",
             notes=(
@@ -910,7 +686,7 @@ def _command_specs() -> Sequence[CommandSpec]:
             name="list_folders",
             help="List all folders in the current user's workspace",
             add_arguments=_add_list_workspace_arguments,
-            handler=_handle_list_folders,
+            handler=_bind(command_list_folders),
             default_output="table",
             usage="caption list_folders [--full]",
             notes=(
@@ -923,7 +699,7 @@ def _command_specs() -> Sequence[CommandSpec]:
             name="create_project",
             help="Create a new project in a workspace",
             add_arguments=_add_create_project_arguments,
-            handler=_handle_create_project,
+            handler=_bind(command_create_project),
             usage="caption create_project <name> [--description TEXT] [--workspace-id UUID] [--dry-run]",
             notes=("If --workspace-id is omitted, workspace ID is resolved from /users/me/workspace.",),
             example="caption create_project \"My Project\" --description \"First draft\"",
@@ -932,7 +708,7 @@ def _command_specs() -> Sequence[CommandSpec]:
             name="create_folder",
             help="Create a new folder in a workspace",
             add_arguments=_add_create_folder_arguments,
-            handler=_handle_create_folder,
+            handler=_bind(command_create_folder),
             usage="caption create_folder <name> [--description TEXT] [--parent UUID] [--workspace-id UUID] [--dry-run]",
             notes=("If --workspace-id is omitted, workspace ID is resolved from /users/me/workspace.",),
             example="caption create_folder \"My Folder\" --parent <parent-folder-uuid>",
@@ -941,7 +717,7 @@ def _command_specs() -> Sequence[CommandSpec]:
             name="edit_project",
             help="Edit a project via PATCH /projects/{projectId}",
             add_arguments=_add_edit_project_arguments,
-            handler=_handle_edit_project,
+            handler=_bind(command_edit_project),
             usage=(
                 "caption edit_project <project_id> "
                 "[--name TEXT] [--description TEXT|--clear-description] [--folder UUID|--clear-folder] [--dry-run]"
@@ -957,7 +733,7 @@ def _command_specs() -> Sequence[CommandSpec]:
             name="edit_folder",
             help="Edit a folder via PATCH /workspaces/folders/{folderId}",
             add_arguments=_add_edit_folder_arguments,
-            handler=_handle_edit_folder,
+            handler=_bind(command_edit_folder),
             usage=(
                 "caption edit_folder <folder_id> "
                 "[--name TEXT] [--description TEXT|--clear-description] [--parent UUID|--clear-parent] [--dry-run]"
@@ -973,7 +749,7 @@ def _command_specs() -> Sequence[CommandSpec]:
             name="dl_transcript",
             help="Download captions for a transcript",
             add_arguments=_add_dl_transcript_arguments,
-            handler=_handle_dl_transcript,
+            handler=_bind(dl_transcript),
             default_output="md",
             usage="caption dl_transcript <transcript_id> [--timestamp]",
             notes=(
@@ -983,10 +759,10 @@ def _command_specs() -> Sequence[CommandSpec]:
             example="caption --output json dl_transcript <transcript-uuid>",
         ),
         CommandSpec(
-            name="tail",
+            name=_COMMAND_TAIL,
             help="Stream finalized captions for one transcript",
             add_arguments=_add_tail_arguments,
-            handler=_handle_tail,
+            handler=_bind(command_tail),
             default_output="plain",
             usage="caption tail [transcript_id] [--link URL_OR_TOKEN] [--duration SECS|--max-events N|--idle-timeout SECS]",
             notes=(
@@ -1005,7 +781,7 @@ def _command_specs() -> Sequence[CommandSpec]:
             name="assign_speakers",
             help="Assign a speaker to transcript captions by channel and optional diarization index",
             add_arguments=_add_assign_speakers_arguments,
-            handler=_handle_assign_speakers,
+            handler=_bind(command_assign_speakers),
             usage=(
                 "caption assign_speakers (--transcript-id UUID | --project-id UUID) "
                 "--channel {0|1|2|microphone|loopback|external} [--index N] "
@@ -1025,7 +801,7 @@ def _command_specs() -> Sequence[CommandSpec]:
             name="list_speakers",
             help="Summarize speaker assignments for a transcript's captions",
             add_arguments=_add_list_speakers_arguments,
-            handler=_handle_list_speakers,
+            handler=_bind(command_list_speakers),
             default_output="table",
             usage="caption list_speakers <transcript_id>",
             notes=(
@@ -1039,7 +815,7 @@ def _command_specs() -> Sequence[CommandSpec]:
             name="rename_speaker",
             help="Rename a custom speaker across a project",
             add_arguments=_add_rename_speaker_arguments,
-            handler=_handle_rename_speaker,
+            handler=_bind(command_rename_speaker),
             usage="caption rename_speaker <project_id> <speaker_id> --name TEXT [--dry-run]",
             notes=(
                 "PATCHes /projects/{projectId}/speakers/{speakerId}.",
@@ -1049,102 +825,80 @@ def _command_specs() -> Sequence[CommandSpec]:
             ),
             example="caption rename_speaker <project-uuid> <speaker-uuid> --name \"Alice\"",
         ),
-        CommandSpec(
-            name="list_matters",
-            help="List matters from the hosted history server",
-            add_arguments=_add_list_matters_arguments,
-            handler=_handle_list_matters,
-            needs_api=False,
-            default_output="table",
-            usage="caption list_matters [--include-one-shot] [--full] [--clerk-api-key TOKEN] [--org-id ORG]",
-            notes=(
-                "GETs https://history.caption.fyi/api/v1/projects.",
-                "This is separate from list_projects, which uses the main Caption workspace API.",
-                "Default output condenses each matter to id/name/full_name; pass --full for the raw payloads.",
-            ),
-            example="caption list_matters --include-one-shot",
-        ),
-        CommandSpec(
-            name="sync",
-            help="Build or send terminal sessions parsed into SQLite by agentsview",
-            add_arguments=_add_sync_arguments,
-            handler=_handle_sync,
-            needs_api=False,
-            usage=(
-                "caption sync "
-                "--session-id VALUE [--project-name TEXT] [--test|--dry-run] [--yes] [--db-path PATH] "
-                "[--clerk-api-key TOKEN] [--org-id ORG]"
-            ),
-            notes=(
-                "Matches sessions by case-insensitive substring on the raw session ID; use * to select all sessions.",
-                "--session-id '*' without --test requires --yes (it sends every session).",
-                "--project-name overrides session.project in every built payload.",
-                "Use --test (alias: --dry-run) to print the built JSON payloads without sending anything.",
-                "Without --test, builds payloads from the local SQLite DB, then PUTs them to https://history.caption.fyi/api/v1/shares/{session_id}.",
-                "Exits 4 (upstream failure) when any session fails to send; the error message embeds the full sent/failures report.",
-            ),
-            example="caption sync --session-id s1 --org-id org_123",
-        ),
-        CommandSpec(
-            name="create_md",
-            help="Create a Markdown document on the hosted history server",
-            add_arguments=_add_create_md_arguments,
-            handler=_handle_create_md,
-            needs_api=False,
-            usage=(
-                "caption create_md <markdown_file> "
-                "[--project-id UUID|--project-name TEXT] [--title TEXT] [--dry-run] [--clerk-api-key TOKEN] [--org-id ORG]"
-            ),
-            notes=(
-                "POSTs to https://history.caption.fyi/api/v1/projects/md.",
-                "Reads raw_markdown from the file exactly as UTF-8 text.",
-                "--title defaults to the Markdown filename.",
-                "JSON output (the default) returns the full document; table/plain output truncates raw_markdown and plain_text to 100 characters unless --full is passed.",
-                "--dry-run validates inputs and prints {dry_run, method, path, body} without sending.",
-                "If both project selectors are supplied, the server gives --project-id precedence.",
-            ),
-            example='caption create_md README.md --project-name "caption-cli endpoint probe" --title "CLI README"',
-        ),
-        CommandSpec(
-            name="list_md",
-            help="List Markdown document summaries from the hosted history server",
-            add_arguments=_add_list_md_arguments,
-            handler=_handle_list_md,
-            needs_api=False,
-            usage=(
-                "caption list_md [--project TEXT] [--exclude-project TEXT] [--tag TAG] "
-                "[--created-by USER] [--sort recent|most_starred] [--cursor CURSOR] [--limit N] [--full]"
-            ),
-            notes=(
-                "GETs https://history.caption.fyi/api/v1/md.",
-                "--tag and --created-by may be repeated; repeated values are sent as comma-separated query values.",
-                "Default output condenses each document to summary fields; pass --full for the raw payloads.",
-            ),
-            example="caption list_md --limit 50 --sort recent",
-        ),
-        CommandSpec(
-            name="get_md",
-            help="Fetch one Markdown document from the hosted history server",
-            add_arguments=_add_get_md_arguments,
-            handler=_handle_get_md,
-            needs_api=False,
-            default_output="md",
-            usage="caption get_md <id> [--clerk-api-key TOKEN] [--org-id ORG]",
-            notes=(
-                "GETs https://history.caption.fyi/api/v1/md/{id}.",
-                "Saves raw_markdown to --cache-dir/md/{title}.md by default; use --output-file to choose another path.",
-            ),
-            example="caption get_md 019de4db-d14d-7f84-b659-dd9f53d7962c",
-        ),
     )
+
+
+# Built once at import, before any monkeypatching, so _bind captures the real command names.
+_COMMAND_SPECS = _command_specs()
+
+
+def _run_tail(spec: CommandSpec, config: RuntimeConfig, args: argparse.Namespace) -> int:
+    # Streams to stdout itself; rendering options do not apply.
+    if args.output_supplied:
+        raise CliError("tail has one fixed stdout line format: {channel}-{index}: {content}")
+    if args.output_file is not None:
+        raise CliError("tail streams output and cannot use --output-file")
+
+    spec.handler(config, args)
+    return EXIT_SUCCESS
+
+
+def _run_doctor(spec: CommandSpec, config: RuntimeConfig, args: argparse.Namespace) -> int:
+    # Reports failed probes on stderr; --strict turns them into a non-zero exit.
+    result = spec.handler(config, args)
+    failed_probes = [probe for probe in result["probes"] if not probe["available"]]
+    for probe in failed_probes:
+        reason = probe["reason"] or "unknown reason"
+        print(f"doctor: probe '{probe['name']}' failed: {reason}", file=sys.stderr)
+
+    rendered = (
+        render_doctor_output(result)
+        if config.output == "plain"
+        else render_output(result, config.output, command_name=spec.name)
+    )
+    if args.output_file is not None:
+        print(write_output_file(args.output_file, rendered, spec.name), file=sys.stderr)
+    else:
+        print(rendered)
+    return EXIT_USER_INPUT if (failed_probes and args.strict) else EXIT_SUCCESS
+
+
+def _run_standard(spec: CommandSpec, config: RuntimeConfig, args: argparse.Namespace) -> int:
+    # Render the result to --output-file or emit it to stdout.
+    result = spec.handler(config, args)
+    output_file = args.output_file
+
+    if output_file is not None:
+        rendered = render_output(
+            result,
+            config.output,
+            command_name=args.command,
+            search_index=getattr(args, "index", None),
+        )
+        print(write_output_file(output_file, rendered, args.command), file=sys.stderr)
+        return EXIT_SUCCESS
+
+    emit_output(
+        result,
+        config.output,
+        command_name=args.command,
+        search_index=getattr(args, "index", None),
+    )
+    return EXIT_SUCCESS
+
+
+_Runner = Callable[[CommandSpec, RuntimeConfig, argparse.Namespace], int]
+
+# Per-command output handling; commands not listed use _run_standard.
+_RUNNERS: dict[str, _Runner] = {
+    _COMMAND_DOCTOR: _run_doctor,
+    _COMMAND_TAIL: _run_tail,
+}
 
 
 def run(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
-    command_specs = {spec.name: spec for spec in _command_specs()}
-    selected_command = command_specs.get(args.command)
-    if selected_command is None:
-        raise CliError(f"Unsupported command: {args.command}")
+    selected_command = next(spec for spec in _COMMAND_SPECS if spec.name == args.command)
 
     config = RuntimeConfig(
         api_url=os.getenv("CAPTION_API_URL"),
@@ -1159,49 +913,5 @@ def run(argv: Sequence[str] | None = None) -> int:
     if selected_command.needs_meili and not dry_run_requested:
         _require_meili_url(config)
 
-    if args.command == "tail":
-        if args.output_supplied:
-            raise CliError("tail has one fixed stdout line format: {channel}-{index}: {content}")
-        if args.output_file is not None:
-            raise CliError("tail streams output and cannot use --output-file")
-        selected_command.handler(config, args)
-        return 0
-
-    result = selected_command.handler(config, args)
-    if args.command == "doctor":
-        failed_probes = [probe for probe in result["probes"] if not probe["available"]]
-        for probe in failed_probes:
-            reason = probe["reason"] or "unknown reason"
-            print(f"doctor: probe '{probe['name']}' failed: {reason}", file=sys.stderr)
-        rendered = (
-            render_doctor_output(result)
-            if config.output == "plain"
-            else render_output(result, config.output, command_name="doctor")
-        )
-        if args.output_file is not None:
-            print(write_output_file(args.output_file, rendered, "doctor"), file=sys.stderr)
-        else:
-            print(rendered)
-        return 1 if (failed_probes and args.strict) else 0
-
-    output_file = args.output_file
-    if args.command == "get_md" and output_file is None and config.output == "md":
-        output_file = _default_get_md_output_file(result, args)
-
-    if output_file is not None:
-        rendered = render_output(
-            result,
-            config.output,
-            command_name=args.command,
-            search_index=getattr(args, "index", None),
-        )
-        print(write_output_file(output_file, rendered, args.command), file=sys.stderr)
-        return 0
-
-    emit_output(
-        result,
-        config.output,
-        command_name=args.command,
-        search_index=getattr(args, "index", None),
-    )
-    return 0
+    runner = _RUNNERS.get(selected_command.name, _run_standard)
+    return runner(selected_command, config, args)

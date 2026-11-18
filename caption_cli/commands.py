@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 import json
-import os
 import re
 import sys
 import threading
 import time
 import uuid
+from http import HTTPStatus
 from typing import Any, Callable, Mapping
 from urllib.parse import urlparse
 
@@ -14,10 +14,10 @@ import httpx
 import meilisearch
 import socketio
 
-from caption_cli import agentsview
 from caption_cli.core import (
     CliError,
     EXIT_UPSTREAM,
+    HTTP_TIMEOUT_SECONDS,
     RuntimeConfig,
     _authorized_get,
     _authorized_get_json,
@@ -29,12 +29,13 @@ from caption_cli.core import (
     _require_api_token,
     _require_api_url,
     _require_cached_or_fresh_token,
+    _require_meili_url,
     _run_with_single_auth_retry,
+    _search_hit_project_id,
     _truncate_for_cell,
     fetch_current_workspace_id,
     fetch_search_token,
     fetch_workspace_items,
-    resolve_meili_url,
     save_search_token,
     warn_condensed_output,
 )
@@ -44,7 +45,7 @@ def command_token(config: RuntimeConfig, *, show_token: bool = False) -> dict[st
     token_payload = fetch_search_token(_require_api_url(config), api_token)
     save_search_token(config.cache_path, token_payload)
 
-    resolved_url = resolve_meili_url(config)
+    resolved_url = _require_meili_url(config)
     return {
         "token": token_payload.token if show_token else "[REDACTED]",
         "url": resolved_url,
@@ -74,16 +75,6 @@ def command_search(
         return _dedupe_search_result_by_project_id(result)
 
     return _run_with_single_auth_retry(config, _operation, token_payload)
-
-
-def _search_hit_project_id(hit: Mapping[str, Any]) -> str | None:
-    project_id = hit.get("projectId")
-    if project_id is None or project_id == "":
-        scope = hit.get("scope") if isinstance(hit.get("scope"), dict) else {}
-        project_id = scope.get("projectId")
-    if project_id is None or project_id == "":
-        return None
-    return str(project_id)
 
 
 def _dedupe_search_result_by_project_id(result: dict[str, Any]) -> dict[str, Any]:
@@ -169,37 +160,12 @@ def _doctor_caption_available(config: RuntimeConfig) -> tuple[bool, str | None]:
     return True, None
 
 
-def _doctor_agentsview_available(args: Any) -> tuple[bool, str | None]:
-    try:
-        payload = agentsview._agentsview_json(
-            "GET",
-            "/api/v1/md",
-            auth=agentsview._agentsview_auth(args),
-            params={"limit": 1},
-            expected_statuses={200},
-        )
-    except CliError as exc:
-        return False, exc.message
-    except httpx.HTTPError as exc:
-        return False, f"history server unreachable: {exc}"
-    if "documents" not in payload:
-        return False, "GET /api/v1/md response missing 'documents'"
-    return True, None
-
-
-def command_doctor(config: RuntimeConfig, args: Any) -> dict[str, Any]:
+def command_doctor(config: RuntimeConfig) -> dict[str, Any]:
     core_available, core_reason = _doctor_caption_available(config)
-    agentsview_available, agentsview_reason = _doctor_agentsview_available(args)
     probes = [
         {"name": "core", "available": core_available, "reason": core_reason},
-        {"name": "agentsview", "available": agentsview_available, "reason": agentsview_reason},
     ]
-    organization = getattr(args, "org_id", None) or os.getenv("ORGANIZATION_ID")
-    return {
-        "organization": organization,
-        "features": [probe["name"] for probe in probes if probe["available"]],
-        "probes": probes,
-    }
+    return {"probes": probes}
 
 
 def _resolve_workspace_id(api_url: str, api_token: str, workspace_id: str | None) -> str:
@@ -328,7 +294,7 @@ def command_create_project(
         "POST",
         f"/folders/{resolved_workspace_id}/projects",
         json_body=body,
-        expected_statuses={201},
+        expected_statuses={HTTPStatus.CREATED},
     )
     return _project_view(payload)
 
@@ -363,7 +329,7 @@ def command_create_folder(
         "POST",
         f"/folders/{resolved_workspace_id}/folders",
         json_body=body,
-        expected_statuses={200, 201},
+        expected_statuses={HTTPStatus.OK, HTTPStatus.CREATED},
     )
     return _folder_view(payload)
 
@@ -403,7 +369,7 @@ def command_edit_project(
         "PATCH",
         f"/projects/{cleaned_project_id}",
         json_body=body,
-        expected_statuses={200},
+        expected_statuses={HTTPStatus.OK},
     )
     return _project_view(payload)
 
@@ -443,7 +409,7 @@ def command_edit_folder(
         "PATCH",
         f"/folders/{cleaned_folder_id}",
         json_body=body,
-        expected_statuses={200},
+        expected_statuses={HTTPStatus.OK},
     )
     return _folder_view(payload)
 
@@ -772,7 +738,7 @@ def command_tail(
     sio.on("connect_error", _on_connect_error, namespace=_EVENTS_NAMESPACE)
 
     def _run_backfill() -> None:
-        with httpx.Client(timeout=15.0) as client:
+        with httpx.Client(timeout=HTTP_TIMEOUT_SECONDS) as client:
             captions = _fetch_paginated_object_list(
                 api_url,
                 api_token,
@@ -954,12 +920,12 @@ def command_assign_speakers(
             "POST",
             f"/transcripts/{cleaned_transcript_id}/assign-speakers",
             json_body=body,
-            expected_statuses={200, 201},
+            expected_statuses={HTTPStatus.OK, HTTPStatus.CREATED},
         )
         return dict(payload)
 
     cleaned_project_id = _clean_required_id(project_id, "project_id")
-    with httpx.Client(timeout=15.0) as client:
+    with httpx.Client(timeout=HTTP_TIMEOUT_SECONDS) as client:
         transcript_ids = _fetch_project_transcript_ids(
             api_url,
             api_token,
@@ -978,7 +944,7 @@ def command_assign_speakers(
                     "POST",
                     f"/transcripts/{candidate_transcript_id}/assign-speakers",
                     json_body=body,
-                    expected_statuses={200, 201},
+                    expected_statuses={HTTPStatus.OK, HTTPStatus.CREATED},
                     client=client,
                 )
             except CliError as exc:
@@ -1031,7 +997,7 @@ def command_list_speakers(config: RuntimeConfig, *, transcript_id: str) -> dict[
     api_token = _require_api_token(config)
     cleaned_transcript_id = _clean_required_id(transcript_id, "transcript_id")
 
-    with httpx.Client(timeout=15.0) as client:
+    with httpx.Client(timeout=HTTP_TIMEOUT_SECONDS) as client:
         captions = _fetch_paginated_object_list(
             api_url,
             api_token,
@@ -1094,10 +1060,6 @@ def command_rename_speaker(
         "PATCH",
         path,
         json_body=body,
-        expected_statuses={200},
+        expected_statuses={HTTPStatus.OK},
     )
     return dict(payload)
-
-
-def command_sync(config: RuntimeConfig, args: Any) -> Any:
-    return agentsview.command_sync(config, args)

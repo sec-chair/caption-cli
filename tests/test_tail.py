@@ -66,8 +66,8 @@ def _replace_tail_handler(
 
     monkeypatch.setattr(
         cli,
-        "_command_specs",
-        lambda: tuple(replace(spec, handler=wrapped) if spec.name == "tail" else spec for spec in specs),
+        "_COMMAND_SPECS",
+        tuple(replace(spec, handler=wrapped) if spec.name == "tail" else spec for spec in specs),
     )
     return called
 

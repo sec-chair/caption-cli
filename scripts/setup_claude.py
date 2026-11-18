@@ -400,7 +400,7 @@ def write_env_file(env_file: Path, new_values: Mapping[str, str]) -> WriteResult
 
 
 def main() -> int:
-    env_file = Path(__file__).resolve().parent / ".env"
+    env_file = Path(__file__).resolve().parent.parent / ".env"
 
     try:
         auth_token = prompt_for_token()
